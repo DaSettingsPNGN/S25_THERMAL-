@@ -3,52 +3,9 @@
 🐧 S25+ Thermal Intelligence Configuration
 =========================================
 Copyright (c) 2025 PNGN-Tec LLC
-Author: Jesse Vogeler-Wunsch (@DaSettingsPNGN)
 
-Thermal Monitoring Configuration Constants
-==========================================
-Complete configuration for thermal monitoring, prediction, and pattern
-recognition on Android devices.
-
-Configuration Categories:
-- Temperature thresholds and hysteresis
-- Velocity and acceleration thresholds
-- Sampling intervals and history management
-- Statistical analysis parameters
-- Pattern recognition and learning rates
-- Persistence and caching settings
-- S25+ thermal characteristics
-- Termux API integration
-
-S25+ Thermal Characteristics:
-- Thermal mass: 50.0 J/°C (heat capacity)
-- Thermal resistance: 5.0°C/W (cooling efficiency)
-- Ambient coupling: 0.3 (heat transfer coefficient)
-- Max TDP: 15.0 W (Snapdragon 8 Elite thermal design power)
-
-Thermal States:
-- COLD: < 35°C (device cool)
-- OPTIMAL: 35-45°C (normal operation)
-- WARM: 45-55°C (elevated temperature)
-- HOT: 55-65°C (throttling may occur)
-- CRITICAL: > 60°C (heavy throttling)
-
-Network Thermal Impact:
-- WiFi 2.4GHz: +0°C
-- WiFi 5GHz: +1°C
-- Mobile 3G: +2°C
-- Mobile 4G: +3°C
-- Mobile 5G: +5°C (significant thermal load)
-
-Usage:
-    from config import (
-        THERMAL_TEMP_CRITICAL,
-        THERMAL_ZONES,
-        S25_THERMAL_MASS
-    )
-
-Version: 1.0.0
-Platform: Android (Termux)
+Thermal monitoring configuration for Samsung Galaxy S25+ (Snapdragon 8 Elite).
+Hardware-specific constants derived from teardowns and thermal testing.
 """
 
 import os
@@ -57,18 +14,12 @@ import os
 # THERMAL ZONES (Android sysfs paths)
 # ============================================================================
 
-# Note: Battery path may not exist on all devices - code falls back to Termux API
-
 THERMAL_ZONES = {
     'cpu_big': '/sys/class/thermal/thermal_zone0/temp',
     'cpu_little': '/sys/class/thermal/thermal_zone1/temp',
     'gpu': '/sys/class/thermal/thermal_zone2/temp',
     'battery': '/sys/class/power_supply/battery/temp',
-    'skin': '/sys/class/thermal/thermal_zone3/temp',
     'modem': '/sys/class/thermal/thermal_zone4/temp',
-    'npu': '/sys/class/thermal/thermal_zone5/temp',
-    'camera': '/sys/class/thermal/thermal_zone6/temp',
-    'ambient': '/sys/class/thermal/thermal_zone7/temp'
 }
 
 THERMAL_ZONE_NAMES = {
@@ -76,21 +27,15 @@ THERMAL_ZONE_NAMES = {
     'cpu_little': 'CPU Efficiency Cores',
     'gpu': 'GPU (Adreno 830)',
     'battery': 'Battery',
-    'skin': 'Device Surface',
     'modem': '5G Modem',
-    'npu': 'AI Engine',
-    'camera': 'Camera'
 }
 
 THERMAL_ZONE_WEIGHTS = {
     'cpu_big': 0.30,
-    'cpu_little': 0.20,
-    'gpu': 0.20,
+    'cpu_little': 0.25,
+    'gpu': 0.25,
     'battery': 0.15,
-    'skin': 0.10,
     'modem': 0.05,
-    'npu': 0.00,
-    'camera': 0.00
 }
 
 # ============================================================================
@@ -197,7 +142,7 @@ THERMAL_COMMAND_HASH_LENGTH = 8
 
 THERMAL_PERSISTENCE_INTERVAL = 300
 THERMAL_PERSISTENCE_KEY = 'thermal_signatures'
-THERMAL_PERSISTENCE_FILE = 'thermal_signatures.json'  # Simplified path for portability
+THERMAL_PERSISTENCE_FILE = 'thermal_signatures.json'
 
 # ============================================================================
 # VELOCITY THRESHOLDS

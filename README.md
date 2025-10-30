@@ -2,7 +2,7 @@
 
 **Physics-based thermal management for Android devices**
 
-This project provides predictive thermal intelligence through multi-zone temperature monitoring, velocity tracking, and thermal budget forecasting. Built for resource-constrained environments where thermal throttling must be prevented, not managed.
+Predictive thermal intelligence through multi-zone temperature monitoring, velocity tracking, and thermal budget forecasting. Built for resource-constrained environments where thermal throttling must be prevented, not managed.
 
 ![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -26,7 +26,7 @@ The system uses deterministic pattern learning where commands build thermal sign
 
 The difference: Zero thermal crashes vs constant throttling.
 
-**Production Proof:** Serving 500+ concurrent Discord bot users from a Samsung Galaxy S25+ with zero thermal incidents.
+**Production Deployment:** Discord bot serving 645+ members on Samsung Galaxy S25+.
 
 ---
 
@@ -171,7 +171,7 @@ for zone, temp in intel.stats.current.zones.items():
 - GPU
 - Battery (critical for throttling)
 - Modem
-- Ambient temperature
+- Ambient temperature (derived)
 
 ### Zone-Specific Analysis
 
@@ -313,22 +313,6 @@ async def render(ctx):
     await heavy_render_operation()
 ```
 
-### With Performance System
-
-```python
-from s25_thermal import create_thermal_intelligence, integrate_with_performance_system
-import s25_performance
-
-# Create systems
-thermal = create_thermal_intelligence()
-performance = s25_performance.accelerate(quality='balanced', thermal_system=thermal)
-
-await thermal.start()
-
-# Thermal data automatically feeds performance decisions
-# Performance system uses predictions to optimize scheduling
-```
-
 ### Monitoring Loop
 
 ```python
@@ -397,54 +381,6 @@ THERMAL_SIGNATURE_MIN_DELTA = 0.1
 
 ---
 
-## Advanced Features
-
-### Anomaly Detection
-
-```python
-intel = thermal.get_current_intelligence()
-
-for timestamp, anomaly in intel.anomalies:
-    print(f"⚠️ {anomaly}")
-
-# Example output:
-# ⚠️ CPU_BIG anomaly: 65.2°C (expected 52.0±3.5°C)
-# ⚠️ GPU temperature unusual: 62.1°C (CPU: 51.3°C)
-```
-
-### Network Impact Tracking
-
-```python
-# System correlates network type with temperature
-intel = thermal.get_current_intelligence()
-
-if intel.stats.network_impact > 3.0:
-    print(f"🔥 5G adding {intel.stats.network_impact:.1f}°C")
-```
-
-### Charging Detection
-
-```python
-# Charging significantly impacts thermal behavior
-intel = thermal.get_current_intelligence()
-
-if intel.stats.charging_impact > 5.0:
-    print(f"⚡ Charging adding {intel.stats.charging_impact:.1f}°C")
-```
-
-### Event Callbacks
-
-```python
-async def on_thermal_change(intelligence):
-    if intelligence.state == ThermalState.HOT:
-        print(f"🔥 System hot: {max(intelligence.stats.current.zones.values()):.1f}°C")
-
-# Register callback
-thermal.register_callback(on_thermal_change)
-```
-
----
-
 ## File Structure
 
 ```
@@ -454,10 +390,8 @@ s25_thermal/
 ├── shared_types.py          Type definitions
 ├── requirements.txt         Dependencies
 ├── README.md                This file
-├── CHANGELOG.md             Version history
 ├── LICENSE                  MIT license
-├── example_basic.py         Basic usage
-├── example_prediction.py    Prediction demo
+├── example_usage.py         Basic usage demo
 └── example_monitoring.py    Monitoring setup
 ```
 
@@ -484,21 +418,24 @@ Pattern learning uses exponential moving averages to build command thermal signa
 
 ---
 
-## Production Notes
+## Verified Performance
 
-**Tested on:** Samsung Galaxy S25+ (Snapdragon 8 Elite)
+**Production Deployment:** Discord bot serving 645+ members  
+**Test Device:** Samsung Galaxy S25+ (Snapdragon 8 Elite)
 
-**Production Stats:**
-- 500+ concurrent users
-- Zero thermal crashes
-- Average uptime: 168+ hours
-- Thermal-induced queue rate: < 2%
+**Prediction Accuracy (30s horizon, 1 hour production test):**
+- Total predictions: 42,738
+- Overall mean absolute error: 2.96°C
+- Battery zone: 2.60°C MAE (52% within 2°C)
+- GPU zone: 2.70°C MAE (49% within 2°C)
+- CPU zones: 3.3-3.5°C MAE
+- 41% of all predictions within 2°C of actual
 
-**Key Insights:**
+**Hardware Observations:**
 - Battery temperature is the critical throttling threshold (42°C on S25+)
-- 5G adds ~3-4°C vs WiFi
-- Charging adds ~5-7°C baseline
-- Predictive queuing reduces throttling by 95% vs reactive
+- 5G adds measurable thermal load vs WiFi
+- Charging state significantly impacts baseline temperature
+- Per-zone physics model with hardware-specific time constants
 
 ---
 

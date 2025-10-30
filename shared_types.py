@@ -3,56 +3,9 @@
 🐧 S25+ Thermal Intelligence Type Definitions
 ============================================
 Copyright (c) 2025 PNGN-Tec LLC
-Author: Jesse Vogeler-Wunsch (@DaSettingsPNGN)
 
-Thermal Monitoring Shared Types
-===============================
-Central type system for thermal intelligence, providing enums and
-dataclasses for cross-module communication without circular imports.
-
-Type Categories:
-- Enums: ThermalState, ThermalZone, ThermalTrend, NetworkType
-- Samples: ThermalSample (single measurement with metadata)
-- Velocity: ThermalVelocity (rate of change and acceleration)
-- Prediction: ThermalPrediction (future temperature forecasts)
-- Statistics: ThermalStatistics (statistical analysis results)
-- Signatures: ThermalSignature (learned command thermal impact)
-- Intelligence: ThermalIntelligence (complete telemetry package)
-- Events: ThermalEvent (thermal event logging)
-
-Thermal Zones:
-- CPU_BIG: Performance cores (Cortex-X925)
-- CPU_LITTLE: Efficiency cores
-- GPU: Adreno 830 graphics processor
-- BATTERY: Battery temperature sensor
-- MODEM: 5G modem thermal zone
-- AMBIENT: Environmental temperature
-
-Thermal Trends:
-- RAPID_COOLING: < -0.033°C/s
-- COOLING: -0.033 to -0.008°C/s
-- STABLE: -0.008 to +0.008°C/s
-- WARMING: +0.008 to +0.033°C/s
-- RAPID_WARMING: > +0.033°C/s
-
-Usage:
-    from shared_types import (
-        ThermalState,
-        ThermalZone,
-        ThermalIntelligence
-    )
-    
-    if intel.state == ThermalState.CRITICAL:
-        print("Temperature critical!")
-
-Technical Details:
-- All types use dataclasses for clean structure
-- Enums provide type-safe constants
-- Properties add computed attributes
-- No module dependencies (pure types)
-
-Version: 1.0.0
-Platform-agnostic type definitions
+Shared type system for thermal monitoring. Platform-agnostic enums and
+dataclasses used across thermal intelligence modules.
 """
 
 from dataclasses import dataclass, field

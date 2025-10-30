@@ -3,17 +3,9 @@
 🐧 S25+ Thermal Intelligence - Usage Example
 ===========================================
 Copyright (c) 2025 PNGN-Tec LLC
-Author: Jesse Vogeler-Wunsch (@DaSettingsPNGN)
 
-Demonstrates basic usage of the thermal intelligence system including:
-- System initialization and startup
-- Real-time monitoring loop
-- Intelligence data retrieval
-- Temperature prediction
-- Statistics reporting
-- Graceful shutdown
-
-Run this script to see thermal monitoring in action for 60 seconds.
+Basic thermal monitoring demo showing real-time temperature tracking,
+velocity analysis, and prediction with 60-second runtime.
 """
 
 import asyncio
