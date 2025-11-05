@@ -1,43 +1,44 @@
 #!/usr/bin/env python3
 """
-🔥 S25+ Thermal Intelligence System v2.24
-==========================================
-Battery-centric thermal management with physics-based prediction.
+🔥🐧🔥 S25+ Thermal Intelligence System
+====================================
+Copyright (c) 2025 PNGN-Tec LLC
 
-CORE APPROACH:
-- Newton's law of cooling with measured thermal constants
-- Battery backdating only (10s from 30s moving average)
-- Die sensors report current temp - no backdating needed
-- Battery τ=540s >> prediction horizon → pure power integration
-- Tank model: simple battery-focused throttle decisions
-- Dual-confidence learning: per-prediction × sample-size weighting
+Physics-based thermal management for Android devices under continuous load.
 
-NEW IN v2.24:
-- Removed die sensor backdating (test showed 0s optimal vs 7.9s)
-- MAE restored to ~1.5°C range (was 10x worse with die backdating)
-- Battery keeps 10s backdate (30s moving average confirmed)
-- Measurement test validated: die sensors report current, not lagged
+Multi-zone temperature monitoring with Newton's law of cooling predictions. 
+Prevents throttling through proactive thermal budget calculation and workload 
+scheduling. Built for production operation where thermal shutdowns are unacceptable.
+
+Production deployment: Discord bot serving 645+ members on Samsung S25+, 
+24/7 operation with zero thermal shutdowns.
+
+ARCHITECTURE:
+- Multi-zone sensor monitoring (CPU, GPU, battery, modem, chassis)
+- Newton's law of cooling with measured per-zone thermal constants
+- Dual-confidence predictions (physics model × sample-size weighting)
+- Adaptive damping via prediction error feedback
+- Thermal tank status for simple throttle decisions
+- 10s sampling, 30s prediction horizon
 
 HARDWARE (Samsung Galaxy S25+ / Snapdragon 8 Elite):
-- Zone 20 (cpuss-1-0): CPU_BIG - 2× Oryon Prime (τ_meas = 6.6s)
-- Zone 13 (cpuss-0-0): CPU_LITTLE - 6× Oryon efficiency (τ_meas = 6.9s)
-- Zone 23 (gpuss-0): GPU - Adreno 830 (τ_meas = 9.1s)
-- Zone 31 (mdmss-0): Modem - 5G/WiFi (τ_meas = 9.0s)
-- Zone 60 (battery): Battery thermistor (τ = 540s)
-- Zone 52 (sys-therm-5): Chassis reference
-
-THROTTLE POINTS:
-- Samsung throttles at 40°C battery
-- We throttle at 38.5°C (1.5°C safety margin = our MAE)
-- Tank provides simple bool decision: can accept work or not
+- CPU_BIG (cpuss-1-0): 2× Oryon Prime, τ=6.6s
+- CPU_LITTLE (cpuss-0-0): 6× Oryon efficiency, τ=6.9s
+- GPU (gpuss-0): Adreno 830, τ=9.1s
+- MODEM (mdmss-0): 5G/WiFi, τ=9.0s
+- BATTERY: τ=540s (critical for Samsung throttle at 42°C)
+- CHASSIS (sys-therm-5): reference sensor
 
 PHYSICS:
 T(t) = T_amb + (T₀ - T_amb)·exp(-t/τ) + (P·R/k)·(1 - exp(-t/τ))
 
 Battery simplification (τ >> horizon):
-ΔT = (P/C) × Δt
+ΔT ≈ (P/C) × Δt
 
-Measured from step response testing, validated in production.
+PREDICTION ACCURACY:
+~1.5°C MAE at 30s horizon with 10s sampling
+Adaptive damping improves accuracy over time
+Battery zone most predictable (τ=540s)
 """
 
 import sys

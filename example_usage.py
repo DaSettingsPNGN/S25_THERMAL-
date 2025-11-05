@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-🐧 S25+ Thermal Intelligence - Usage Example
+🔥🐧🔥 S25+ Thermal Intelligence - Usage Example
 ===========================================
 Copyright (c) 2025 PNGN-Tec LLC
 
 Basic thermal monitoring demo showing real-time temperature tracking,
-velocity analysis, and prediction with 60-second runtime.
+thermal tank status, and predictions with 60-second runtime.
 """
 
 import asyncio
-from s25_thermal import create_thermal_intelligence
+from s25_thermal import create_thermal_intelligence, ThermalZone
 
 async def main():
     # Create thermal monitoring system
@@ -23,30 +23,34 @@ async def main():
     try:
         # Monitor for 60 seconds
         for i in range(60):
-            # Get current intelligence
-            intel = thermal.get_current_intelligence()
+            # Get current sample
+            sample = thermal.get_current()
             
-            if intel and intel.stats:
-                # Get max temperature across all zones
-                temps = intel.stats.current.zones
-                if temps:
-                    max_temp = max(temps.values())
-                    max_zone = max(temps.items(), key=lambda x: x[1])
-                    
-                    # Display current status
-                    print(f"[{i+1:2d}s] {max_temp:.1f}°C ({max_zone[0].name}) | "
-                          f"State: {intel.state.name:8s} | "
-                          f"Trend: {intel.stats.velocity.trend.name}")
-                    
-                    # Show prediction if available
-                    if intel.prediction:
-                        pred_temp = max(intel.prediction.predicted_temps.values())
-                        print(f"       Predicted in 60s: {pred_temp:.1f}°C | "
-                              f"Budget: {intel.prediction.thermal_budget:.0f}s")
-                    
-                    # Show recommendations if any
-                    if intel.recommendations:
-                        print(f"       ⚠️  {intel.recommendations[0]}")
+            # Get thermal tank status (primary API)
+            tank = thermal.get_tank_status()
+            
+            # Get prediction
+            prediction = thermal.get_prediction()
+            
+            if sample and tank:
+                # Get battery temperature (critical for throttling)
+                battery = sample.zones.get(ThermalZone.BATTERY, 0.0)
+                
+                # Display current status
+                print(f"[{i+1:2d}s] Battery: {battery:.1f}°C | "
+                      f"State: {tank.state.name:8s} | "
+                      f"Throttle: {'YES' if tank.should_throttle else 'NO'}")
+                
+                # Show thermal budget
+                if tank.thermal_budget < 300:  # Less than 5 min
+                    print(f"       ⚠️  Budget: {tank.thermal_budget:.0f}s | "
+                          f"Cooldown: {tank.cooldown_needed:.0f}s")
+                
+                # Show prediction if available
+                if prediction:
+                    pred_battery = prediction.predicted_temps.get(ThermalZone.BATTERY, 0.0)
+                    print(f"       Predicted (+30s): {pred_battery:.1f}°C | "
+                          f"Confidence: {prediction.confidence:.0%}")
             
             await asyncio.sleep(1)
     
@@ -62,19 +66,18 @@ async def main():
         # Show statistics
         stats = thermal.get_statistics()
         print("📊 Statistics:")
-        print(f"   Samples collected: {stats['samples_collected']}")
-        print(f"   Predictions made: {stats['predictions_made']}")
-        print(f"   Patterns learned: {stats['patterns_learned']}")
-        print(f"   Current state: {stats['current_state']}")
-        print(f"   Confidence: {stats['confidence']:.1%}")
+        print(f"   Runtime: {stats.get('runtime_seconds', 0):.0f}s")
+        print(f"   Samples: {stats.get('total_samples', 0)}")
+        print(f"   Predictions: {stats.get('total_predictions', 0)}")
         
-        # Show persistence stats
-        if 'persistence' in stats:
-            p = stats['persistence']
-            print(f"\n💾 Persistence:")
-            print(f"   Command signatures: {p['command_signatures']}")
-            print(f"   Telemetry signatures: {p['telemetry_signatures']}")
-            print(f"   High confidence patterns: {p['high_confidence_patterns']}")
+        # Show final tank status
+        tank = thermal.get_tank_status()
+        if tank:
+            print(f"\n🔥 Final Status:")
+            print(f"   Battery: {tank.battery_temp_current:.1f}°C")
+            print(f"   Peak: {tank.peak_temp:.1f}°C")
+            print(f"   State: {tank.state.name}")
+            print(f"   Cooling rate: {tank.cooling_rate:+.3f}°C/s")
 
 if __name__ == "__main__":
     asyncio.run(main())

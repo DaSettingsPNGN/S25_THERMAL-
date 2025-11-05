@@ -1,179 +1,150 @@
 #!/usr/bin/env python3
 """
-🐧 S25+ Thermal Intelligence Configuration
+🔥🐧🔥 S25+ Thermal Intelligence Configuration
 =========================================
 Copyright (c) 2025 PNGN-Tec LLC
 
-Thermal monitoring configuration for Samsung Galaxy S25+ (Snapdragon 8 Elite).
-Hardware-specific constants derived from teardowns and thermal testing.
+Configuration constants for Samsung Galaxy S25+ thermal monitoring.
+These are defined in s25_thermal.py - this file documents them for reference.
+
+To modify: Edit constants directly in s25_thermal.py (lines 64-241)
 """
 
-import os
-
 # ============================================================================
-# THERMAL ZONES (Android sysfs paths)
+# CORE PREDICTION PARAMETERS
 # ============================================================================
 
-THERMAL_ZONES = {
-    'cpu_big': '/sys/class/thermal/thermal_zone0/temp',
-    'cpu_little': '/sys/class/thermal/thermal_zone1/temp',
-    'gpu': '/sys/class/thermal/thermal_zone2/temp',
-    'battery': '/sys/class/power_supply/battery/temp',
-    'modem': '/sys/class/thermal/thermal_zone4/temp',
+CHASSIS_DAMPING_FACTOR = 0.90           # Chassis thermal inertia
+THERMAL_PREDICTION_HORIZON = 30.0       # Seconds ahead (not 60!)
+THERMAL_SAMPLE_INTERVAL_MS = 10000      # 10s uniform sampling
+THERMAL_HISTORY_SIZE = 300              # 50 min history
+MIN_SAMPLES_FOR_PREDICTIONS = 12        # 2 min minimum
+
+# ============================================================================
+# ADAPTIVE DAMPING HISTORY SIZES
+# ============================================================================
+
+DAMPING_HISTORY_SLOW_ZONES = 10         # Battery: 20 min
+DAMPING_HISTORY_FAST_ZONES = 1          # CPU/GPU: 2 min
+DAMPING_HISTORY_MEDIUM_ZONES = 2        # Chassis: 4 min
+
+# ============================================================================
+# TIMEOUTS
+# ============================================================================
+
+THERMAL_SUBPROCESS_TIMEOUT = 2.0        # seconds
+THERMAL_NETWORK_TIMEOUT = 3.0           # seconds
+
+# ============================================================================
+# NETWORK AWARENESS
+# ============================================================================
+
+THERMAL_NETWORK_AWARENESS_ENABLED = True
+THERMAL_WIFI_5G_FREQ_MIN = 5000         # MHz
+
+# ============================================================================
+# CONFIDENCE
+# ============================================================================
+
+CONFIDENCE_SAFETY_SCALE = 0.5
+THERMAL_SENSOR_CONFIDENCE_REDUCED = 0.3
+
+# ============================================================================
+# SAMSUNG S25+ HARDWARE CONSTANTS
+# ============================================================================
+
+S25_PLUS_BATTERY_CAPACITY = 4900        # mAh
+S25_PLUS_BATTERY_INTERNAL_RESISTANCE = 0.150  # Ohms
+S25_PLUS_VAPOR_CHAMBER_EFFICIENCY = 0.85
+S25_PLUS_SCREEN_SIZE = 6.7              # inches
+
+# ============================================================================
+# PER-ZONE THERMAL CONSTANTS
+# ============================================================================
+
+ZONE_THERMAL_CONSTANTS = {
+    'CPU_BIG': {
+        'thermal_mass': 0.025,           # J/K
+        'thermal_resistance': 2.8,       # °C/W
+        'ambient_coupling': 0.80,
+        'peak_power': 6.0,               # W
+        'idle_power': 0.1,
+    },
+    'CPU_LITTLE': {
+        'thermal_mass': 0.020,
+        'thermal_resistance': 3.0,
+        'ambient_coupling': 0.75,
+        'peak_power': 3.0,
+        'idle_power': 0.05,
+    },
+    'GPU': {
+        'thermal_mass': 0.030,
+        'thermal_resistance': 3.2,
+        'ambient_coupling': 0.75,
+        'peak_power': 8.0,
+        'idle_power': 0.2,
+    },
+    'MODEM': {
+        'thermal_mass': 0.015,
+        'thermal_resistance': 4.0,
+        'ambient_coupling': 0.70,
+        'peak_power': 4.0,
+        'idle_power': 0.5,
+    },
+    'BATTERY': {
+        'thermal_mass': 25.0,
+        'thermal_resistance': 10.0,
+        'ambient_coupling': 0.30,
+        'peak_power': 0.0,
+        'idle_power': 0.0,
+    },
 }
 
-THERMAL_ZONE_NAMES = {
-    'cpu_big': 'CPU Performance Cores',
-    'cpu_little': 'CPU Efficiency Cores',
-    'gpu': 'GPU (Adreno 830)',
-    'battery': 'Battery',
-    'modem': '5G Modem',
-}
-
-THERMAL_ZONE_WEIGHTS = {
-    'cpu_big': 0.30,
-    'cpu_little': 0.25,
-    'gpu': 0.25,
-    'battery': 0.15,
-    'modem': 0.05,
-}
-
 # ============================================================================
-# SAMPLING
+# TEMPERATURE THRESHOLDS
 # ============================================================================
 
-THERMAL_SAMPLE_INTERVAL_MS = 10000
-THERMAL_HISTORY_SIZE = 1000
-THERMAL_PREDICTION_HORIZON = 60.0
+THERMAL_TEMP_COLD = 20.0                # °C
+THERMAL_TEMP_OPTIMAL_MIN = 25.0
+THERMAL_TEMP_OPTIMAL_MAX = 38.0
+THERMAL_TEMP_WARM = 40.0
+THERMAL_TEMP_HOT = 42.0                 # Samsung throttle point
+THERMAL_TEMP_CRITICAL = 45.0
 
 # ============================================================================
-# NETWORK IMPACT
+# HYSTERESIS (PREVENTS STATE FLAPPING)
 # ============================================================================
 
-NETWORK_THERMAL_IMPACT = {
-    'WIFI_2G': 0.0,
-    'WIFI_5G': 1.0,
-    'MOBILE_3G': 2.0,
-    'MOBILE_4G': 3.0,
-    'MOBILE_5G': 5.0
-}
+THERMAL_HYSTERESIS_UP = 1.0             # °C
+THERMAL_HYSTERESIS_DOWN = 2.0           # °C
 
 # ============================================================================
-# STATISTICAL THRESHOLDS
+# VELOCITY THRESHOLDS
 # ============================================================================
 
-THERMAL_PERCENTILE_WINDOWS = [5, 25, 75, 95]
-THERMAL_ANOMALY_THRESHOLD = 3.0
+THERMAL_VELOCITY_RAPID_COOLING = -0.10  # °C/s
+THERMAL_VELOCITY_COOLING = -0.02
+THERMAL_VELOCITY_WARMING = 0.05
+THERMAL_VELOCITY_RAPID_WARMING = 0.15
 
 # ============================================================================
-# PATTERN RECOGNITION
+# SENSOR VALIDATION
 # ============================================================================
 
-THERMAL_SIGNATURE_WINDOW = 300
-THERMAL_CORRELATION_THRESHOLD = 0.7
-
-# ============================================================================
-# TERMUX API
-# ============================================================================
-
-TERMUX_BATTERY_STATUS_CMD = ['termux-battery-status']
-TERMUX_WIFI_INFO_CMD = ['termux-wifi-connectioninfo']
-TERMUX_TELEPHONY_INFO_CMD = ['termux-telephony-deviceinfo']
-TERMUX_SENSORS_CMD = ['termux-sensor', '-s', 'all', '-n', '1']
+THERMAL_SENSOR_TEMP_MIN = 15.0          # °C sanity check
+THERMAL_SENSOR_TEMP_MAX = 75.0          # °C sanity check
 
 # ============================================================================
 # FEATURES
 # ============================================================================
 
 THERMAL_PREDICTION_ENABLED = True
-THERMAL_PATTERN_RECOGNITION_ENABLED = True
-THERMAL_NETWORK_AWARENESS_ENABLED = True
 
 # ============================================================================
-# S25+ THERMAL CHARACTERISTICS
+# NOTES
 # ============================================================================
 
-S25_THERMAL_MASS = 50.0
-S25_THERMAL_RESISTANCE = 5.0
-S25_AMBIENT_COUPLING = 0.3
-S25_MAX_TDP = 15.0
-
-# ============================================================================
-# TEMPERATURE THRESHOLDS
-# ============================================================================
-
-THERMAL_TEMP_COLD = 35.0
-THERMAL_TEMP_OPTIMAL_MIN = 35.0
-THERMAL_TEMP_OPTIMAL_MAX = 45.0
-THERMAL_TEMP_WARM = 55.0
-THERMAL_TEMP_HOT = 65.0
-THERMAL_TEMP_CRITICAL = 60.0
-
-# ============================================================================
-# HYSTERESIS
-# ============================================================================
-
-THERMAL_HYSTERESIS_UP = 2.0
-THERMAL_HYSTERESIS_DOWN = 2.0
-
-# ============================================================================
-# TIMEOUTS
-# ============================================================================
-
-THERMAL_SUBPROCESS_TIMEOUT = 2.0
-THERMAL_TELEMETRY_TIMEOUT = 5.0
-THERMAL_SHUTDOWN_TIMEOUT = 5.0
-THERMAL_NETWORK_TIMEOUT = 2.0
-
-# ============================================================================
-# PROCESSING
-# ============================================================================
-
-THERMAL_TELEMETRY_BATCH_SIZE = 100
-THERMAL_TELEMETRY_PROCESSING_INTERVAL = 1.0
-THERMAL_SIGNATURE_MAX_COUNT = 1000
-THERMAL_LEARNING_RATE = 0.1
-THERMAL_SIGNATURE_MIN_DELTA = 0.1
-THERMAL_COMMAND_HASH_LENGTH = 8
-
-# ============================================================================
-# PERSISTENCE
-# ============================================================================
-
-THERMAL_PERSISTENCE_INTERVAL = 300
-THERMAL_PERSISTENCE_KEY = 'thermal_signatures'
-THERMAL_PERSISTENCE_FILE = 'thermal_signatures.json'
-
-# ============================================================================
-# VELOCITY THRESHOLDS
-# ============================================================================
-
-THERMAL_VELOCITY_RAPID_COOLING = -2.0 / 60
-THERMAL_VELOCITY_COOLING = -0.5 / 60
-THERMAL_VELOCITY_WARMING = 0.5 / 60
-THERMAL_VELOCITY_RAPID_WARMING = 2.0 / 60
-
-# ============================================================================
-# CONFIDENCE CALCULATIONS
-# ============================================================================
-
-THERMAL_MIN_SAMPLES_CONFIDENCE = 50
-THERMAL_PREDICTION_CONFIDENCE_DECAY = 300.0
-THERMAL_SENSOR_TEMP_MIN = -20.0
-THERMAL_SENSOR_TEMP_MAX = 100.0
-THERMAL_SENSOR_CONFIDENCE_REDUCED = 0.7
-
-# ============================================================================
-# NETWORK DETECTION
-# ============================================================================
-
-THERMAL_WIFI_5G_FREQ_MIN = 5000
-
-# ============================================================================
-# RECOMMENDATIONS
-# ============================================================================
-
-THERMAL_BUDGET_WARNING_SECONDS = 60
-THERMAL_NETWORK_IMPACT_WARNING = 3.0
-THERMAL_CHARGING_IMPACT_WARNING = 5.0
-THERMAL_COMMAND_IMPACT_WARNING = 5.0
+# Pattern learning: REMOVED (not in current code)
+# Command tracking: REMOVED (not in current code)
+# 60s horizon: CHANGED to 30s
+# Multi-zone weights: REMOVED (battery-centric now)

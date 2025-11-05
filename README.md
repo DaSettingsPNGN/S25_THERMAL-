@@ -1,288 +1,232 @@
-# 🐧 S25+ Thermal Intelligence System
+# 🔥🐧🔥 S25+ Thermal Intelligence System
 
 **Physics-based thermal management for Android devices**
 
-Predictive thermal intelligence through multi-zone temperature monitoring, velocity tracking, and thermal budget forecasting. Built for resource-constrained environments where thermal throttling must be prevented, not managed.
-
-![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-![Platform](https://img.shields.io/badge/platform-Android-green)
+Multi-zone temperature monitoring with Newton's law of cooling predictions. Prevents throttling through thermal budget forecasting and proactive workload scheduling.
 
 ---
 
 ## What This Does
 
-Creates predictive thermal models using Newton's law of cooling, thermal mass calculations, and multi-zone sensor fusion. Forecasts temperature changes 30-60 seconds ahead and calculates thermal budgets before executing operations.
+Monitors thermal zones on Android devices, applies physics models with measured thermal constants, and predicts temperatures 30s ahead. Provides thermal budget calculations and simple bool throttle decisions through tank status API.
 
-The system uses deterministic pattern learning where commands build thermal signatures over time. This makes performance optimization and thermal prediction reproducible.
+**Production deployment:** Discord bot serving 645+ members on Samsung Galaxy S25+, 24/7 operation with zero thermal shutdowns.
 
 ---
 
 ## Why Predictive?
 
-**Reactive systems:** Read temperature → React when hot → Throttle → Hope it cools
+**Reactive systems:** Read temp → React when hot → Throttle → Hope it cools
 
-**Predictive systems:** Model thermal physics → Forecast temperature → Queue work strategically
+**Predictive systems:** Model thermal physics → Forecast temperature → Schedule work
 
-The difference: Zero thermal crashes vs constant throttling.
-
-**Production Deployment:** Discord bot serving 645+ members on Samsung Galaxy S25+.
+Result: Continuous operation under load vs constant throttling.
 
 ---
 
 ## Installation
 
-Install Python dependencies:
-
 ```bash
 git clone https://github.com/DaSettingsPNGN/S25_THERMAL.git
 cd S25_THERMAL
-pip install -r requirements.txt
+pip install numpy
 ```
 
-**Required**
-- numpy (version 1.20.0 or later)
-- asyncio (Python 3.8+ standard library)
+**Requirements:**
+- Python 3.8+
+- numpy ≥1.20.0
 
-**Optional**
-- psutil (for enhanced system monitoring)
-
-On Termux (Android), install additional packages:
-
+**On Termux (Android):**
 ```bash
 pkg install python numpy
-pip install -r requirements.txt
+pip install numpy
 ```
 
 ---
 
 ## Basic Usage
 
-### Initialize System
+### Initialize
 
 ```python
 from s25_thermal import create_thermal_intelligence
 
-# Create thermal intelligence system
 thermal = create_thermal_intelligence()
 await thermal.start()
 
-# Get current thermal state
-intel = thermal.get_current_intelligence()
-print(f"Temperature: {intel.stats.current.zones['battery']:.1f}°C")
-print(f"Trend: {intel.stats.velocity.trend.name}")
+# Get current reading
+sample = thermal.get_current()
+if sample:
+    battery = sample.zones.get(ThermalZone.BATTERY)
+    print(f"Battery: {battery:.1f}°C")
 ```
 
-### Predict Future Temperature
+### Check Throttle Status
 
 ```python
-# Get prediction for 30 seconds ahead
-intel = thermal.get_current_intelligence()
+# Primary API - simple bool decision
+tank = thermal.get_tank_status()
 
-if intel.prediction:
-    predicted = intel.prediction.predicted_temps['battery']
-    budget = intel.prediction.thermal_budget
-    
-    print(f"Current: {intel.stats.current.zones['battery']:.1f}°C")
-    print(f"Predicted (+30s): {predicted:.1f}°C")
-    print(f"Thermal budget: {budget:.0f} seconds")
+if tank.should_throttle:
+    print(f"⚠️ Too hot - wait {tank.cooldown_needed:.0f}s")
+    await asyncio.sleep(tank.cooldown_needed)
+else:
+    print(f"✅ Safe - budget: {tank.thermal_budget:.0f}s")
+    await execute_work()
 ```
 
-### Track Command Impact
+### Get Prediction
 
 ```python
-# Track thermal cost of operations
-command_hash = "render_animation_123"
+prediction = thermal.get_prediction()
 
-thermal.track_command("render", command_hash)
-# ... execute your operation ...
-thermal.complete_command("render", command_hash)
+if prediction:
+    battery_pred = prediction.predicted_temps.get(ThermalZone.BATTERY)
+    print(f"Battery (+30s): {battery_pred:.1f}°C")
+    print(f"Confidence: {prediction.confidence:.0%}")
+```
 
-# Check learned impact
-signature = thermal.patterns.get_thermal_impact("render")
-if signature:
-    print(f"Average temp rise: {signature.avg_delta_temp:.2f}°C")
-    print(f"Confidence: {signature.confidence:.0%}")
+---
+
+## Core API
+
+### Thermal Tank Status
+
+Primary throttle decision interface:
+
+```python
+@dataclass
+class ThermalTankStatus:
+    battery_temp_current: float      # Current battery °C
+    battery_temp_predicted: float    # At 30s horizon
+    should_throttle: bool            # Bool decision
+    cooldown_needed: float           # Seconds to wait
+    thermal_budget: float            # Seconds until throttle
+    cooling_rate: float              # °C/s
+    peak_temp: float                 # Hottest zone now
+    state: ThermalState              # Overall state enum
+```
+
+### Thermal Zones
+
+```python
+from s25_thermal import ThermalZone
+
+ThermalZone.CPU_BIG      # High-performance cores
+ThermalZone.CPU_LITTLE   # Efficiency cores  
+ThermalZone.GPU          # Graphics
+ThermalZone.BATTERY      # Battery thermistor (critical)
+ThermalZone.MODEM        # 5G/WiFi modem
+ThermalZone.CHASSIS      # Chassis reference
+```
+
+### Predictions
+
+```python
+@dataclass
+class ThermalPrediction:
+    predicted_state: ThermalState
+    predicted_temps: Dict[ThermalZone, float]
+    horizon: float                    # 30.0s
+    time_to_state: float  
+    confidence: float                 # 0.0-1.0
+    recommended_delay: float
+    thermal_budget: float
+    timestamp: float
 ```
 
 ---
 
 ## Temperature Prediction
 
-### Physics-Based Model
+### Physics Model
 
-The system uses Newton's law of cooling for accurate predictions:
+Newton's law of cooling with measured constants:
 
 ```python
-# Core prediction equation
-predicted_temp = current_temp + (velocity * time) + (0.5 * acceleration * time²)
+# Per-zone evolution
+T(t) = T_amb + (T₀ - T_amb)·exp(-t/τ) + (P·R/k)·(1 - exp(-t/τ))
 
-# Cooling rate based on ambient temperature
-cooling_rate = -ambient_coupling * (current_temp - ambient) / thermal_resistance
-
-# Net temperature change
-net_rate = velocity + cooling_rate
+# Battery simplified (τ=540s >> 30s horizon)
+ΔT ≈ (P/C) × Δt
 ```
 
-### Thermal Budget Calculation
+**Measured thermal time constants:**
+- CPU_BIG: τ = 6.6s
+- CPU_LITTLE: τ = 6.9s
+- GPU: τ = 9.1s
+- MODEM: τ = 9.0s
+- BATTERY: τ = 540s (high thermal mass)
+
+### Adaptive Damping
+
+System tracks prediction errors by regime (heating/cooling/stable) and adjusts momentum factors over time:
 
 ```python
-# How long until throttling?
-intel = thermal.get_current_intelligence()
+# TransientResponseTuner tracks errors
+# Separate history sizes per thermal time constant:
+# - Battery: 120 samples (20 min)
+# - Fast zones: 12 samples (2 min)
+# - Chassis: 24 samples (4 min)
 
-if intel.prediction:
-    budget = intel.prediction.thermal_budget
-    delay = intel.prediction.recommended_delay
-    
-    if budget < 60:
-        print(f"⚠️ Throttling in {budget:.0f}s - delay operations by {delay:.1f}s")
+# Momentum factors adapt to reduce bias
+# Improves accuracy over extended runs
 ```
 
-### Velocity and Acceleration
+### Thermal Budget
 
 ```python
-# Temperature isn't just a number - it's a trend
-intel = thermal.get_current_intelligence()
-velocity = intel.stats.velocity
+tank = thermal.get_tank_status()
 
-print(f"Temperature changing at {velocity.overall:+.3f}°C/s")
-print(f"Acceleration: {velocity.acceleration:+.4f}°C/s²")
-print(f"Trend: {velocity.trend.name}")
+# Seconds until Samsung throttles (42°C battery)
+budget = tank.thermal_budget
 
-# Trends: RAPID_COOLING, COOLING, STABLE, WARMING, RAPID_WARMING
+if budget < 60:
+    print(f"⚠️ Throttling in {budget:.0f}s")
+    await asyncio.sleep(tank.cooldown_needed)
 ```
 
 ---
 
 ## Multi-Zone Monitoring
 
-### Available Thermal Zones
+### Zone Readings
 
 ```python
-intel = thermal.get_current_intelligence()
+sample = thermal.get_current()
 
-for zone, temp in intel.stats.current.zones.items():
-    print(f"{zone.name}: {temp:.1f}°C")
+if sample:
+    for zone, temp in sample.zones.items():
+        confidence = sample.confidence.get(zone, 0.0)
+        print(f"{zone.name}: {temp:.1f}°C (conf: {confidence:.0%})")
 ```
 
-**Monitored zones:**
-- CPU Big cores (high-performance)
-- CPU Little cores (efficiency)
-- GPU
-- Battery (critical for throttling)
-- Modem
-- Ambient temperature (derived)
+**Hardware mapping (Samsung S25+):**
+- Zone 20 (cpuss-1-0): CPU_BIG
+- Zone 13 (cpuss-0-0): CPU_LITTLE
+- Zone 23 (gpuss-0): GPU
+- Zone 31 (mdmss-0): MODEM
+- Zone 60 (battery): BATTERY (critical)
+- Zone 52 (sys-therm-5): CHASSIS
 
-### Zone-Specific Analysis
-
-```python
-# Get statistics for each zone
-intel = thermal.get_current_intelligence()
-stats = intel.stats
-
-for zone in ['battery', 'cpu_big', 'gpu']:
-    current = stats.current.zones.get(zone)
-    mean = stats.mean.get(zone)
-    velocity = stats.velocity.zones.get(zone)
-    
-    print(f"{zone}: {current:.1f}°C (avg: {mean:.1f}°C, Δ: {velocity:+.3f}°C/s)")
-```
-
----
-
-## Pattern Learning
-
-### Command Thermal Signatures
-
-The system learns thermal patterns from operations:
+### Thermal States
 
 ```python
-# Commands automatically build profiles
-thermal.track_render("animation_render", thermal_cost_mw=250, duration=2.5)
+from s25_thermal import ThermalState
 
-# After multiple observations, get learned behavior
-signature = thermal.patterns.get_thermal_impact("animation_render")
-
-print(f"Average thermal cost: {signature.avg_thermal_cost} mW")
-print(f"Average temp rise: {signature.avg_delta_temp:.2f}°C")
-print(f"Sample count: {signature.sample_count}")
-print(f"Confidence: {signature.confidence:.0%}")
-```
-
-### Predict Operation Impact
-
-```python
-# Will this sequence cause problems?
-commands = ["render", "compress", "upload"]
-predicted_impact = thermal.patterns.predict_impact(commands)
-
-print(f"Expected temperature rise: {predicted_impact:.2f}°C")
-
-# Make decision
-intel = thermal.get_current_intelligence()
-current_temp = intel.stats.current.zones['battery']
-
-if current_temp + predicted_impact > 40.0:
-    print("⚠️ Sequence would trigger throttling - queuing for later")
-```
-
-### Pattern Persistence
-
-```python
-# Signatures are automatically saved
-await thermal.save_signatures()
-
-# On next startup, patterns are restored
-# Learning continues across restarts
-```
-
----
-
-## Thermal States
-
-### State Classification
-
-```python
-intel = thermal.get_current_intelligence()
-
-# State is automatically determined
-state = intel.state
-
-if state == ThermalState.OPTIMAL:
-    print("✅ System cool - full performance available")
-elif state == ThermalState.WARM:
-    print("⚠️ System warming - monitor closely")
-elif state == ThermalState.HOT:
-    print("🔥 System hot - reduce workload")
-elif state == ThermalState.CRITICAL:
-    print("🚨 Critical temperature - immediate action required")
-```
-
-**Thresholds (Samsung S25+):**
-- OPTIMAL: < 42°C (normal operation)
-- WARM: 42-50°C (increased monitoring)
-- HOT: 50-60°C (throttling begins)
-- CRITICAL: > 60°C (emergency shutdown)
-
-### Recommendations
-
-```python
-intel = thermal.get_current_intelligence()
-
-for recommendation in intel.recommendations:
-    print(f"💡 {recommendation}")
-
-# Example output:
-# 💡 Thermal budget: 47s
-# 💡 Delay: 2.1s
-# 💡 5G: +3.2°C
+ThermalState.COLD       # Well below throttle
+ThermalState.OPTIMAL    # Normal operation
+ThermalState.WARM       # Approaching limits
+ThermalState.HOT        # Near throttle
+ThermalState.CRITICAL   # Immediate action required
+ThermalState.UNKNOWN    # Insufficient data
 ```
 
 ---
 
 ## Integration Examples
 
-### With Discord Bot
+### Discord Bot
 
 ```python
 import discord
@@ -294,41 +238,32 @@ thermal = create_thermal_intelligence()
 @bot.event
 async def on_ready():
     await thermal.start()
-    print(f"Thermal system initialized")
 
 @bot.command()
 async def render(ctx):
-    # Check thermal state before heavy operation
-    intel = thermal.get_current_intelligence()
+    tank = thermal.get_tank_status()
     
-    if intel.state in [ThermalState.HOT, ThermalState.CRITICAL]:
-        await ctx.send("⚠️ System too hot - operation queued")
+    if tank.should_throttle:
+        await ctx.send(f"⚠️ System hot - cooling {tank.cooldown_needed:.0f}s")
         return
     
-    if intel.prediction and intel.prediction.thermal_budget < 30:
-        await ctx.send(f"⏳ Thermal budget low - delaying {intel.prediction.recommended_delay:.0f}s")
-        await asyncio.sleep(intel.prediction.recommended_delay)
-    
-    # Safe to execute
-    await heavy_render_operation()
+    await heavy_operation()
 ```
 
 ### Monitoring Loop
 
 ```python
-async def thermal_monitor():
+async def monitor():
     thermal = create_thermal_intelligence()
     await thermal.start()
     
     while True:
-        intel = thermal.get_current_intelligence()
+        tank = thermal.get_tank_status()
+        sample = thermal.get_current()
         
-        print(f"Battery: {intel.stats.current.zones['battery']:.1f}°C")
-        print(f"State: {intel.state.name}")
-        print(f"Velocity: {intel.stats.velocity.overall:+.3f}°C/s")
-        
-        if intel.prediction:
-            print(f"Budget: {intel.prediction.thermal_budget:.0f}s")
+        if sample:
+            battery = sample.zones.get(ThermalZone.BATTERY)
+            print(f"Battery: {battery:.1f}°C | {tank.state.name} | Budget: {tank.thermal_budget:.0f}s")
         
         await asyncio.sleep(10)
 ```
@@ -337,47 +272,101 @@ async def thermal_monitor():
 
 ## Configuration
 
-### Thermal Thresholds
-
-Edit `config.py`:
+Edit constants in `s25_thermal.py`:
 
 ```python
-# Temperature thresholds (°C)
-THERMAL_TEMP_OPTIMAL_MAX = 42.0
-THERMAL_TEMP_WARM = 50.0
-THERMAL_TEMP_HOT = 60.0
-THERMAL_TEMP_CRITICAL = 70.0
+# Core prediction
+THERMAL_PREDICTION_HORIZON = 30.0       # seconds ahead
+THERMAL_SAMPLE_INTERVAL_MS = 10000      # 10s sampling
+THERMAL_HISTORY_SIZE = 300              # 50 min history
+MIN_SAMPLES_FOR_PREDICTIONS = 12        # 2 min minimum
 
-# Hysteresis (prevents state flapping)
-THERMAL_HYSTERESIS_UP = 2.0
-THERMAL_HYSTERESIS_DOWN = 3.0
+# Adaptive damping history
+DAMPING_HISTORY_SLOW_ZONES = 10         # Battery: 20 min
+DAMPING_HISTORY_FAST_ZONES = 1          # CPU/GPU: 2 min  
+DAMPING_HISTORY_MEDIUM_ZONES = 2        # Chassis: 4 min
+
+# Chassis damping
+CHASSIS_DAMPING_FACTOR = 0.90           # Thermal inertia
 ```
 
-### Sampling Configuration
+### Per-Zone Constants
 
 ```python
-# Sampling interval (milliseconds)
-THERMAL_SAMPLE_INTERVAL_MS = 1000
-
-# History size (samples to keep)
-THERMAL_HISTORY_SIZE = 1000
-
-# Prediction horizon (seconds)
-THERMAL_PREDICTION_HORIZON = 30.0
+ZONE_THERMAL_CONSTANTS = {
+    'CPU_BIG': {
+        'thermal_mass': 0.025,          # J/K
+        'thermal_resistance': 2.8,      # °C/W
+        'ambient_coupling': 0.80,
+        'peak_power': 6.0,              # W
+    },
+    # ... other zones
+}
 ```
 
-### Pattern Learning
+---
 
-```python
-# Maximum signatures to store
-THERMAL_SIGNATURE_MAX_COUNT = 100
+## Architecture
 
-# Learning rate (0-1)
-THERMAL_LEARNING_RATE = 0.2
+**Components (all in s25_thermal.py):**
 
-# Minimum temperature change to track
-THERMAL_SIGNATURE_MIN_DELTA = 0.1
+1. **ThermalTelemetryCollector** - Reads `/sys/class/thermal/` sensors, detects network state
+2. **ZonePhysicsEngine** - Newton's law predictions per zone, adaptive damping
+3. **TransientResponseTuner** - Tracks prediction errors, tunes momentum factors
+4. **ThermalTank** - Simple throttle decision logic, battery-centric
+5. **ThermalIntelligenceSystem** - Main orchestration, public API
+
+**Flow:**
+- 10s sampling interval (uniform)
+- Physics engine predicts 30s ahead
+- Prediction validated against actual measurement
+- Errors fed to adaptive tuner
+- Tank status computed from prediction
+- Thermal budget calculated
+
+**Key insight:** Battery τ=540s dominates throttle behavior. Samsung throttles at 42°C battery temperature. System focuses prediction accuracy on battery zone.
+
+---
+
+## Production Metrics
+
+**Deployment:** Discord bot, 645+ members, Samsung S25+
+
+**Prediction accuracy:** ~1.5°C MAE at 30s horizon with 10s sampling
+
+**Observations:**
+- Battery zone most predictable (high thermal mass)
+- Fast zones (CPU/GPU) harder to predict (low τ)
+- Adaptive damping improves over time
+- Network state (5G vs WiFi) impacts baseline
+- Charging state significantly affects temperature
+- Zero thermal shutdowns in production
+
+**Thermal constants measured from step response testing in production workload.**
+
+---
+
+## Troubleshooting
+
+### No Sensors Found
+
+Check Termux permissions:
+```bash
+termux-setup-storage
+ls /sys/class/thermal/thermal_zone*/temp
 ```
+
+### Low Prediction Accuracy
+
+Wait for adaptive damping calibration:
+- Battery: 20 min (120 samples)
+- CPU/GPU: 2 min (12 samples)
+
+System improves accuracy over time by tracking prediction errors.
+
+### Battery Temperature Flat
+
+Battery has high thermal mass (τ=540s). Changes are slow. This is expected behavior.
 
 ---
 
@@ -385,94 +374,13 @@ THERMAL_SIGNATURE_MIN_DELTA = 0.1
 
 ```
 s25_thermal/
-├── s25_thermal.py           Main intelligence system
-├── config.py                Thermal configuration
-├── shared_types.py          Type definitions
-├── requirements.txt         Dependencies
-├── README.md                This file
-├── LICENSE                  MIT license
-├── example_usage.py         Basic usage demo
-└── example_monitoring.py    Monitoring setup
+├── s25_thermal.py       # Complete system (2454 lines)
+├── README.md           # This file
+├── CHANGELOG.md        # Version history
+└── LICENSE             # MIT license
 ```
 
----
-
-## How It Works
-
-The system operates through several components:
-
-1. **Telemetry Collection** - Multi-zone temperature sensor reading
-2. **Physics Engine** - Newton's law of cooling, thermal mass modeling
-3. **Pattern Recognition** - Command thermal signature learning
-4. **Statistical Analysis** - Trend detection, anomaly identification
-5. **Prediction Engine** - Future temperature forecasting
-6. **Intelligence Assembly** - Comprehensive thermal state reporting
-
-Temperature changes follow physics laws, not just thresholds. The system models:
-- Thermal mass (heat capacity of device)
-- Thermal resistance (heat dissipation rate)
-- Ambient coupling (environmental heat exchange)
-- Zone correlations (how components affect each other)
-
-Pattern learning uses exponential moving averages to build command thermal signatures, enabling predictive workload scheduling.
-
----
-
-## Verified Performance
-
-**Production Deployment:** Discord bot serving 645+ members  
-**Test Device:** Samsung Galaxy S25+ (Snapdragon 8 Elite)
-
-**Prediction Accuracy (30s horizon, 1 hour production test):**
-- Total predictions: 42,738
-- Overall mean absolute error: 2.96°C
-- Battery zone: 2.60°C MAE (52% within 2°C)
-- GPU zone: 2.70°C MAE (49% within 2°C)
-- CPU zones: 3.3-3.5°C MAE
-- 41% of all predictions within 2°C of actual
-
-**Hardware Observations:**
-- Battery temperature is the critical throttling threshold (42°C on S25+)
-- 5G adds measurable thermal load vs WiFi
-- Charging state significantly impacts baseline temperature
-- Per-zone physics model with hardware-specific time constants
-
----
-
-## Troubleshooting
-
-### Sensors Not Found
-
-On Termux, ensure permissions:
-
-```bash
-termux-setup-storage
-pkg install termux-api
-```
-
-Install Termux:API app from F-Droid.
-
-### Prediction Inaccuracy
-
-Increase sample history:
-
-```python
-# In config.py
-THERMAL_HISTORY_SIZE = 2000
-```
-
-Wait 10-15 minutes for accurate ambient baseline.
-
-### Pattern Not Learning
-
-Ensure sufficient samples:
-
-```python
-signature = thermal.patterns.get_thermal_impact("command")
-if signature:
-    print(f"Samples: {signature.sample_count}")
-    # Need 10+ samples for high confidence
-```
+**Single file architecture:** All components inline. No external dependencies except numpy.
 
 ---
 
@@ -480,16 +388,14 @@ if signature:
 
 **Jesse Vogeler-Wunsch** @ PNGN-Tec LLC
 
-Reach me on Discord: **@DaSettingsPNGN**
-
-Part of the PNGN performance systems suite for resource-constrained environments.
+Discord: **@DaSettingsPNGN**
 
 ---
-
-*Built on a phone. Optimized for mobile-first performance.*
 
 ## License
 
 MIT License. See LICENSE file.
 
 ---
+
+*Physics-based thermal management for continuous operation under load.*
