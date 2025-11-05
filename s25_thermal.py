@@ -251,49 +251,43 @@ THERMAL_PREDICTION_ENABLED = True
 # SHARED TYPES
 # ============================================================================
 
-try:
-    from shared_types import ThermalState, ThermalZone, ThermalTrend, NetworkType, MemoryPressureLevel
-    logger.info("Shared types imported successfully")
-except ImportError:
-    logger.warning("Shared types not available - using fallback definitions")
-    
-    class ThermalState(Enum):
-        COLD = auto()
-        OPTIMAL = auto()
-        WARM = auto()
-        HOT = auto()
-        CRITICAL = auto()
-        UNKNOWN = auto()
-    
-    class ThermalZone(Enum):
-        CPU_BIG = 20       # cpuss-1-0: 2× Oryon Prime aggregate
-        CPU_LITTLE = 13    # cpuss-0-0: 6× Oryon efficiency aggregate  
-        GPU = 23           # gpuss-0: Adreno 830
-        BATTERY = 60       # battery thermistor
-        MODEM = 31         # mdmss-0: 5G/WiFi modem
-        CHASSIS = 52       # sys-therm-5: chassis thermal reference
-    
-    class ThermalTrend(Enum):
-        RAPID_COOLING = auto()
-        COOLING = auto()
-        STABLE = auto()
-        WARMING = auto()
-        RAPID_WARMING = auto()
-    
-    class NetworkType(Enum):
-        UNKNOWN = auto()
-        OFFLINE = auto()
-        WIFI_2G = auto()
-        WIFI_5G = auto()
-        MOBILE_3G = auto()
-        MOBILE_4G = auto()
-        MOBILE_5G = auto()
-    
-    class MemoryPressureLevel(IntEnum):
-        NORMAL = 0
-        MODERATE = 1
-        HIGH = 2
-        CRITICAL = 3
+class ThermalState(Enum):
+    COLD = auto()
+    OPTIMAL = auto()
+    WARM = auto()
+    HOT = auto()
+    CRITICAL = auto()
+    UNKNOWN = auto()
+
+class ThermalZone(Enum):
+    CPU_BIG = 20       # cpuss-1-0: 2× Oryon Prime aggregate
+    CPU_LITTLE = 13    # cpuss-0-0: 6× Oryon efficiency aggregate  
+    GPU = 23           # gpuss-0: Adreno 830
+    BATTERY = 60       # battery thermistor
+    MODEM = 31         # mdmss-0: 5G/WiFi modem
+    CHASSIS = 52       # sys-therm-5: chassis thermal reference
+
+class ThermalTrend(Enum):
+    RAPID_COOLING = auto()
+    COOLING = auto()
+    STABLE = auto()
+    WARMING = auto()
+    RAPID_WARMING = auto()
+
+class NetworkType(Enum):
+    UNKNOWN = auto()
+    OFFLINE = auto()
+    WIFI_2G = auto()
+    WIFI_5G = auto()
+    MOBILE_3G = auto()
+    MOBILE_4G = auto()
+    MOBILE_5G = auto()
+
+class MemoryPressureLevel(IntEnum):
+    NORMAL = 0
+    MODERATE = 1
+    HIGH = 2
+    CRITICAL = 3
 
 # ============================================================================
 # DATA STRUCTURES
