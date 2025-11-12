@@ -74,10 +74,10 @@ logger = logging.getLogger('PNGN.S25Thermal')
 # ============================================================================
 # PREDICTION PARAMETERS
 # ============================================================================
-THERMAL_PREDICTION_HORIZON = 15.0      # seconds ahead to predict
+THERMAL_PREDICTION_HORIZON = 30.0      # seconds ahead to predict
 THERMAL_SAMPLE_INTERVAL_MS = 1000      # 1s uniform sampling
 THERMAL_HISTORY_SIZE = 120             # samples to keep (120s = 2 minutes)
-MIN_SAMPLES_FOR_PREDICTIONS = 5       # minimum samples before making predictions
+MIN_SAMPLES_FOR_PREDICTIONS = 3       # minimum samples before making predictions
 
 # Confidence scaling
 CONFIDENCE_SAFETY_SCALE = 0.5          # prediction safety scaling
@@ -169,7 +169,7 @@ S25_PLUS_SCREEN_SIZE = 6.7                    # inches
 ZONE_THERMAL_CONSTANTS = {
     'CPU_BIG': {
         'thermal_mass': 0.005,         # J/K
-        'thermal_resistance': 1.50,    # K/W
+        'thermal_resistance': 1.00,    # K/W
         'ambient_coupling': 0.90,      # coupled to vapor chamber
         'peak_power': 6.0,             # W
         'idle_power': 0.1,
@@ -178,7 +178,7 @@ ZONE_THERMAL_CONSTANTS = {
     },
     'CPU_LITTLE': {
         'thermal_mass': 0.010,         # J/K
-        'thermal_resistance': 2.00,    # K/W
+        'thermal_resistance': 1.50,    # K/W
         'ambient_coupling': 0.90,      # coupled to vapor chamber
         'peak_power': 4.0,
         'idle_power': 0.05,
@@ -214,7 +214,7 @@ ZONE_THERMAL_CONSTANTS = {
     },
     'CHASSIS': {
         'thermal_mass': 15.0,         # J/K (vapor chamber + frame)
-        'thermal_resistance': 0.25,   # K/W
+        'thermal_resistance': 0.50,   # K/W
         'ambient_coupling': 1.0,      # IS the ambient coupling
         'peak_power': 0.0,            # passive
         'idle_power': 0.0,
@@ -2100,8 +2100,7 @@ class ThermalTank:
     """
     
     # CPU velocity thresholds (°C/s) - tuned from validation data
-    CPU_VELOCITY_DANGER = 1.0     # P95+ level, immediate throttle
-    CPU_VELOCITY_WARNING = 0.5    # Watch closely
+    CPU_VELOCITY_DANGER = 3.0
     
     def __init__(self, physics_engine: 'ZonePhysicsEngine'):
         self.physics = physics_engine
