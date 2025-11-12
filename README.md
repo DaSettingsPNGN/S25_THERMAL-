@@ -1,26 +1,28 @@
 # 🔥🐧🔥 S25+ Thermal Intelligence System
 
-**Physics-based thermal management for Android devices**
+**Physics-based + empirical hybrid thermal management for Android devices**
 
-Multi-zone temperature monitoring with Newton's law of cooling predictions. Prevents throttling through thermal budget forecasting and proactive workload scheduling.
+Multi-zone temperature monitoring with Newton's law predictions and observed peak shortcuts. Dual-condition throttle system: battery temperature prediction + CPU velocity spike detection.
 
 ---
 
 ## What This Does
 
-Monitors thermal zones on Android devices, applies physics models with measured thermal constants, and predicts temperatures 30s ahead. Provides thermal budget calculations and simple bool throttle decisions through tank status API.
+Monitors 7 thermal zones, predicts temperatures 30s ahead using physics (or observed peaks when throttled), detects regime changes via CPU velocity spikes, and provides simple bool throttle decisions.
 
-**Production deployment:** Discord bot serving 645+ members on Samsung Galaxy S25+, 24/7 operation with zero thermal shutdowns.
+**Production:** Discord bot serving 645+ members on Samsung S25+, 24/7, zero thermal shutdowns.
 
 ---
 
-## Why Predictive?
+## Why Dual-Condition Throttle?
 
-**Reactive systems:** Read temp → React when hot → Throttle → Hope it cools
+**Problem 1:** Battery (τ=540s) reacts slowly. CPUs (τ=14-19s) spike first during regime changes. Physics model can't predict discontinuities.
 
-**Predictive systems:** Model thermal physics → Forecast temperature → Schedule work
+**Solution 1:** CPU velocity spike detection (>1.0°C/s) catches regime changes before physics breaks.
 
-Result: Continuous operation under load vs constant throttling.
+**Problem 2:** Physics model catastrophically under-predicts when throttled (-30 to -60°C errors).
+
+**Solution 2:** When temp >= throttle_start, predict observed_peak from validation data instead of physics.
 
 ---
 
@@ -36,54 +38,54 @@ pip install numpy
 - Python 3.8+
 - numpy ≥1.20.0
 
-**On Termux (Android):**
+**On Termux:**
 ```bash
 pkg install python numpy
-pip install numpy
 ```
 
 ---
 
-## Basic Usage
+## Quick Start
 
 ### Initialize
 
 ```python
-from s25_thermal import create_thermal_intelligence
+from s25_thermal import create_thermal_intelligence, ThermalZone
 
 thermal = create_thermal_intelligence()
 await thermal.start()
 
-# Get current reading
 sample = thermal.get_current()
 if sample:
     battery = sample.zones.get(ThermalZone.BATTERY)
     print(f"Battery: {battery:.1f}°C")
 ```
 
-### Check Throttle Status
+### Check Throttle Status (Dual-Condition)
 
 ```python
-# Primary API - simple bool decision
 tank = thermal.get_tank_status()
 
+# Throttle reason: NONE, BATTERY_TEMP, CPU_VELOCITY, or BOTH
 if tank.should_throttle:
-    print(f"⚠️ Too hot - wait {tank.cooldown_needed:.0f}s")
-    await asyncio.sleep(tank.cooldown_needed)
+    print(f"🛑 Throttling: {tank.throttle_reason.name}")
+    print(f"   Battery: {tank.battery_temp_current:.1f}°C")
+    print(f"   CPU_BIG vel: {tank.cpu_big_velocity:+.3f}°C/s")
+    await asyncio.sleep(30)
 else:
-    print(f"✅ Safe - budget: {tank.thermal_budget:.0f}s")
+    print(f"✅ Safe - headroom: {tank.headroom_seconds:.0f}s")
     await execute_work()
 ```
 
-### Get Prediction
+### Monitor Velocities (Regime Change Detection)
 
 ```python
-prediction = thermal.get_prediction()
+tank = thermal.get_tank_status()
 
-if prediction:
-    battery_pred = prediction.predicted_temps.get(ThermalZone.BATTERY)
-    print(f"Battery (+30s): {battery_pred:.1f}°C")
-    print(f"Confidence: {prediction.confidence:.0%}")
+# Normal: <0.4°C/s, Warning: >0.5°C/s, Danger: >1.0°C/s
+if tank.cpu_big_velocity > 1.0 or tank.cpu_little_velocity > 1.0:
+    print("⚠️ Regime change detected - workload spike!")
+    # Throttle kicks in automatically
 ```
 
 ---
@@ -92,32 +94,42 @@ if prediction:
 
 ### Thermal Tank Status
 
-Primary throttle decision interface:
+**Primary interface - dual throttle conditions:**
 
 ```python
+from s25_thermal import ThermalTankStatus, ThrottleReason
+
 @dataclass
 class ThermalTankStatus:
     battery_temp_current: float      # Current battery °C
     battery_temp_predicted: float    # At 30s horizon
-    should_throttle: bool            # Bool decision
-    cooldown_needed: float           # Seconds to wait
-    thermal_budget: float            # Seconds until throttle
-    cooling_rate: float              # °C/s
-    peak_temp: float                 # Hottest zone now
-    state: ThermalState              # Overall state enum
+    should_throttle: bool            # True = stop work
+    throttle_reason: ThrottleReason  # Why throttling (if at all)
+    headroom_seconds: float          # Seconds until battery throttle
+    cooling_rate: float              # Battery °C/s (negative = heating)
+    cpu_big_velocity: float          # CPU_BIG °C/s (regime detector)
+    cpu_little_velocity: float       # CPU_LITTLE °C/s (regime detector)
+```
+
+**ThrottleReason enum:**
+```python
+class ThrottleReason(Enum):
+    NONE = auto()           # Safe to operate
+    BATTERY_TEMP = auto()   # Battery too hot
+    CPU_VELOCITY = auto()   # Regime change detected
+    BOTH = auto()           # Both conditions triggered
 ```
 
 ### Thermal Zones
 
 ```python
-from s25_thermal import ThermalZone
-
-ThermalZone.CPU_BIG      # High-performance cores
-ThermalZone.CPU_LITTLE   # Efficiency cores  
-ThermalZone.GPU          # Graphics
-ThermalZone.BATTERY      # Battery thermistor (critical)
+ThermalZone.CPU_BIG      # Oryon Prime cores
+ThermalZone.CPU_LITTLE   # Oryon efficiency cores
+ThermalZone.GPU          # Adreno 830
+ThermalZone.BATTERY      # Battery thermistor (critical for throttle)
 ThermalZone.MODEM        # 5G/WiFi modem
-ThermalZone.CHASSIS      # Chassis reference
+ThermalZone.CHASSIS      # Vapor chamber reference
+ThermalZone.AMBIENT      # Ambient air
 ```
 
 ### Predictions
@@ -125,66 +137,75 @@ ThermalZone.CHASSIS      # Chassis reference
 ```python
 @dataclass
 class ThermalPrediction:
-    predicted_state: ThermalState
+    timestamp: float                        # When prediction made
+    horizon: float                          # 30.0s ahead
     predicted_temps: Dict[ThermalZone, float]
-    horizon: float                    # 30.0s
-    time_to_state: float  
-    confidence: float                 # 0.0-1.0
-    recommended_delay: float
-    thermal_budget: float
-    timestamp: float
+    confidence: float                       # 0.0-1.0
+    confidence_by_zone: Dict[ThermalZone, float]
+    thermal_budget: float                   # Seconds until throttle
+    power_by_zone: Dict[ThermalZone, float] # Power used in prediction
 ```
 
 ---
 
 ## Temperature Prediction
 
-### Physics Model
+### Hybrid Approach
 
-Newton's law of cooling with measured constants:
-
+**Normal operation (temp < throttle_start):**
 ```python
-# Per-zone evolution
+# Newton's law of cooling
 T(t) = T_amb + (T₀ - T_amb)·exp(-t/τ) + (P·R/k)·(1 - exp(-t/τ))
-
-# Battery simplified (τ=540s >> 30s horizon)
-ΔT ≈ (P/C) × Δt
 ```
 
-**Measured thermal time constants:**
-- CPU_BIG: τ = 6.6s
-- CPU_LITTLE: τ = 6.9s
-- GPU: τ = 9.1s
+**Throttled regime (temp >= throttle_start):**
+```python
+# Use observed peak from validation data
+if current_temp >= THROTTLE_START:
+    predicted_temp = OBSERVED_PEAK  # Empirical, not physics
+```
+
+**Why?** Physics breaks at regime changes. Model assumes constant power - throttling changes that assumption mid-flight. Use empirical data instead.
+
+### Observed Peaks (from validation)
+
+```python
+'CPU_BIG': 79.1°C      # Starts throttling at 45°C
+'CPU_LITTLE': 93.4°C   # Starts throttling at 48°C
+'GPU': 58.1°C          # Starts throttling at 38°C
+'MODEM': 59.7°C        # Starts throttling at 40°C
+'BATTERY': 35.2°C      # Doesn't self-throttle
+```
+
+### Thermal Time Constants
+
+**Measured from hardware:**
+- CPU_BIG: τ = 18.7s
+- CPU_LITTLE: τ = 14.3s
+- GPU: τ = 22.3s
 - MODEM: τ = 9.0s
 - BATTERY: τ = 540s (high thermal mass)
+- CHASSIS: τ = 120s (vapor chamber + frame)
 
-### Adaptive Damping
+### Dual Throttle Conditions
 
-System tracks prediction errors by regime (heating/cooling/stable) and adjusts momentum factors over time:
-
+**Condition 1: Battery Temperature**
 ```python
-# TransientResponseTuner tracks errors
-# Separate history sizes per thermal time constant:
-# - Battery: 120 samples (20 min)
-# - Fast zones: 12 samples (2 min)
-# - Chassis: 24 samples (4 min)
-
-# Momentum factors adapt to reduce bias
-# Improves accuracy over extended runs
+# Samsung throttles at 40-42°C battery
+# We throttle at 38.5°C (safety margin)
+if battery_predicted >= 38.5:
+    throttle_reason = BATTERY_TEMP
 ```
 
-### Thermal Budget
-
+**Condition 2: CPU Velocity**
 ```python
-tank = thermal.get_tank_status()
-
-# Seconds until Samsung throttles (42°C battery)
-budget = tank.thermal_budget
-
-if budget < 60:
-    print(f"⚠️ Throttling in {budget:.0f}s")
-    await asyncio.sleep(tank.cooldown_needed)
+# P95 velocity ~1.0°C/s, normal <0.4°C/s
+# >1.0°C/s indicates regime change (workload spike)
+if cpu_big_velocity > 1.0 or cpu_little_velocity > 1.0:
+    throttle_reason = CPU_VELOCITY
 ```
+
+**Rationale:** Battery lags (τ=540s), CPUs react fast (τ=14-19s). Regime changes spike CPUs before battery reacts. Velocity catches discontinuities physics can't predict.
 
 ---
 
@@ -197,36 +218,33 @@ sample = thermal.get_current()
 
 if sample:
     for zone, temp in sample.zones.items():
-        confidence = sample.confidence.get(zone, 0.0)
-        print(f"{zone.name}: {temp:.1f}°C (conf: {confidence:.0%})")
+        print(f"{zone.name}: {temp:.1f}°C")
 ```
 
 **Hardware mapping (Samsung S25+):**
-- Zone 20 (cpuss-1-0): CPU_BIG
-- Zone 13 (cpuss-0-0): CPU_LITTLE
-- Zone 23 (gpuss-0): GPU
-- Zone 31 (mdmss-0): MODEM
-- Zone 60 (battery): BATTERY (critical)
-- Zone 52 (sys-therm-5): CHASSIS
+- Zone 20: CPU_BIG (cpuss-1-0)
+- Zone 13: CPU_LITTLE (cpuss-0-0)
+- Zone 23: GPU (gpuss-0)
+- Zone 31: MODEM (mdmss-0)
+- Zone 60: BATTERY (battery sensor)
+- Zone 53: CHASSIS (sys-therm-0 vapor chamber)
+- Zone 52: AMBIENT (sys-therm-5 air temp)
 
 ### Thermal States
 
 ```python
-from s25_thermal import ThermalState
-
 ThermalState.COLD       # Well below throttle
 ThermalState.OPTIMAL    # Normal operation
 ThermalState.WARM       # Approaching limits
 ThermalState.HOT        # Near throttle
-ThermalState.CRITICAL   # Immediate action required
-ThermalState.UNKNOWN    # Insufficient data
+ThermalState.CRITICAL   # Immediate action needed
 ```
 
 ---
 
 ## Integration Examples
 
-### Discord Bot
+### Discord Bot with Dual Throttle
 
 ```python
 import discord
@@ -244,7 +262,12 @@ async def render(ctx):
     tank = thermal.get_tank_status()
     
     if tank.should_throttle:
-        await ctx.send(f"⚠️ System hot - cooling {tank.cooldown_needed:.0f}s")
+        if tank.throttle_reason == ThrottleReason.CPU_VELOCITY:
+            await ctx.send(f"⚠️ Regime change detected - wait 30s")
+        elif tank.throttle_reason == ThrottleReason.BATTERY_TEMP:
+            await ctx.send(f"🔥 Battery hot: {tank.battery_temp_current:.1f}°C")
+        else:
+            await ctx.send(f"🛑 Both conditions triggered!")
         return
     
     await heavy_operation()
@@ -263,7 +286,13 @@ async def monitor():
         
         if sample:
             battery = sample.zones.get(ThermalZone.BATTERY)
-            print(f"Battery: {battery:.1f}°C | {tank.state.name} | Budget: {tank.thermal_budget:.0f}s")
+            
+            status = f"Battery: {battery:.1f}°C | "
+            status += f"Throttle: {tank.throttle_reason.name} | "
+            status += f"Headroom: {tank.headroom_seconds:.0f}s | "
+            status += f"CPU_BIG vel: {tank.cpu_big_velocity:+.3f}°C/s"
+            
+            print(status)
         
         await asyncio.sleep(10)
 ```
@@ -272,35 +301,26 @@ async def monitor():
 
 ## Configuration
 
-Edit constants in `s25_thermal.py`:
+Key constants in `s25_thermal.py`:
 
 ```python
-# Core prediction
+# Prediction
 THERMAL_PREDICTION_HORIZON = 30.0       # seconds ahead
-THERMAL_SAMPLE_INTERVAL_MS = 10000      # 10s sampling
-THERMAL_HISTORY_SIZE = 300              # 50 min history
-MIN_SAMPLES_FOR_PREDICTIONS = 12        # 2 min minimum
+MIN_SAMPLES_FOR_PREDICTIONS = 3         # minimum before predicting
 
-# Adaptive damping history
-DAMPING_HISTORY_SLOW_ZONES = 10         # Battery: 20 min
-DAMPING_HISTORY_FAST_ZONES = 1          # CPU/GPU: 2 min  
-DAMPING_HISTORY_MEDIUM_ZONES = 2        # Chassis: 4 min
+# Throttle thresholds
+TANK_THROTTLE_TEMP = 38.5               # Battery °C
+CPU_VELOCITY_DANGER = 1.0               # °C/s (P95 level)
+CPU_VELOCITY_WARNING = 0.5              # °C/s (watch closely)
 
-# Chassis damping
-CHASSIS_DAMPING_FACTOR = 0.90           # Thermal inertia
-```
-
-### Per-Zone Constants
-
-```python
-ZONE_THERMAL_CONSTANTS = {
+# Throttle curves (observed from validation)
+COMPONENT_THROTTLE_CURVES = {
     'CPU_BIG': {
-        'thermal_mass': 0.025,          # J/K
-        'thermal_resistance': 2.8,      # °C/W
-        'ambient_coupling': 0.80,
-        'peak_power': 6.0,              # W
+        'temp_start': 45.0,
+        'observed_peak': 79.1,
+        ...
     },
-    # ... other zones
+    ...
 }
 ```
 
@@ -308,23 +328,23 @@ ZONE_THERMAL_CONSTANTS = {
 
 ## Architecture
 
-**Components (all in s25_thermal.py):**
+**Single file (2798 lines):** s25_thermal.py contains everything.
 
-1. **ThermalTelemetryCollector** - Reads `/sys/class/thermal/` sensors, detects network state
-2. **ZonePhysicsEngine** - Newton's law predictions per zone, adaptive damping
-3. **TransientResponseTuner** - Tracks prediction errors, tunes momentum factors
-4. **ThermalTank** - Simple throttle decision logic, battery-centric
-5. **ThermalIntelligenceSystem** - Main orchestration, public API
+**Components:**
+1. **ThermalTelemetryCollector** - Reads sensors, detects network
+2. **ZonePhysicsEngine** - Newton's law predictions + observed peak shortcuts
+3. **TransientResponseTuner** - Tracks errors, tunes momentum
+4. **ThermalTank** - Dual-condition throttle logic
+5. **ThermalIntelligenceSystem** - Main orchestration
 
 **Flow:**
-- 10s sampling interval (uniform)
-- Physics engine predicts 30s ahead
-- Prediction validated against actual measurement
-- Errors fed to adaptive tuner
-- Tank status computed from prediction
-- Thermal budget calculated
-
-**Key insight:** Battery τ=540s dominates throttle behavior. Samsung throttles at 42°C battery temperature. System focuses prediction accuracy on battery zone.
+- 1s sampling (10s full cycle)
+- Check if temp >= throttle_start
+  - Yes: predict observed_peak
+  - No: use physics (Newton's law)
+- Check CPU velocities for regime changes
+- Compute throttle decision (battery temp OR CPU velocity)
+- Return ThermalTankStatus
 
 ---
 
@@ -332,17 +352,17 @@ ZONE_THERMAL_CONSTANTS = {
 
 **Deployment:** Discord bot, 645+ members, Samsung S25+
 
-**Prediction accuracy:** ~1.5°C MAE at 30s horizon with 10s sampling
+**Prediction accuracy:**
+- Normal regime: ~1.5°C MAE at 30s horizon
+- Throttled regime: Use observed peaks (avoids -30 to -60°C errors)
 
-**Observations:**
-- Battery zone most predictable (high thermal mass)
-- Fast zones (CPU/GPU) harder to predict (low τ)
-- Adaptive damping improves over time
-- Network state (5G vs WiFi) impacts baseline
-- Charging state significantly affects temperature
-- Zero thermal shutdowns in production
+**Throttle detection:**
+- Normal CPU velocity: <0.4°C/s (P90)
+- Warning level: >0.5°C/s
+- Danger level: >1.0°C/s (P95+)
+- Max observed: CPU_BIG 9.5°C/s, CPU_LITTLE 14.0°C/s
 
-**Thermal constants measured from step response testing in production workload.**
+**Result:** Zero thermal shutdowns, proactive throttling before damage.
 
 ---
 
@@ -350,44 +370,28 @@ ZONE_THERMAL_CONSTANTS = {
 
 ### No Sensors Found
 
-Check Termux permissions:
 ```bash
 termux-setup-storage
 ls /sys/class/thermal/thermal_zone*/temp
 ```
 
-### Low Prediction Accuracy
+### False CPU Velocity Alerts
 
-Wait for adaptive damping calibration:
-- Battery: 20 min (120 samples)
-- CPU/GPU: 2 min (12 samples)
+Velocity threshold (1.0°C/s) might be too sensitive. Increase to 1.5°C/s:
 
-System improves accuracy over time by tracking prediction errors.
-
-### Battery Temperature Flat
-
-Battery has high thermal mass (τ=540s). Changes are slow. This is expected behavior.
-
----
-
-## File Structure
-
-```
-s25_thermal/
-├── s25_thermal.py       # Complete system (2454 lines)
-├── README.md           # This file
-├── CHANGELOG.md        # Version history
-└── LICENSE             # MIT license
+```python
+ThermalTank.CPU_VELOCITY_DANGER = 1.5  # Was 1.0
 ```
 
-**Single file architecture:** All components inline. No external dependencies except numpy.
+### Battery Temperature Stable
+
+Battery has τ=540s. Changes are slow. This is correct behavior.
 
 ---
 
 ## Contact
 
-**Jesse Vogeler-Wunsch** @ PNGN-Tec LLC
-
+**Jesse Vogeler-Wunsch** @ PNGN-Tec LLC  
 Discord: **@DaSettingsPNGN**
 
 ---
@@ -398,4 +402,4 @@ MIT License. See LICENSE file.
 
 ---
 
-*Physics-based thermal management for continuous operation under load.*
+*Physics-based + empirical hybrid thermal management with dual-condition throttle detection.*

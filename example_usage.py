@@ -4,80 +4,88 @@
 ===========================================
 Copyright (c) 2025 PNGN-Tec LLC
 
-Basic thermal monitoring demo showing real-time temperature tracking,
-thermal tank status, and predictions with 60-second runtime.
+Real thermal monitoring showing dual-condition throttle system:
+- Battery temperature prediction
+- CPU velocity spike detection
+- Observed peak predictions for throttled zones
 """
 
 import asyncio
 from s25_thermal import create_thermal_intelligence, ThermalZone
 
 async def main():
-    # Create thermal monitoring system
     print("🔥 Initializing S25+ Thermal Intelligence...")
     thermal = create_thermal_intelligence()
     
-    # Start monitoring
     await thermal.start()
     print("✅ Monitoring started!\n")
     
     try:
-        # Monitor for 60 seconds
         for i in range(60):
-            # Get current sample
             sample = thermal.get_current()
-            
-            # Get thermal tank status (primary API)
             tank = thermal.get_tank_status()
-            
-            # Get prediction
             prediction = thermal.get_prediction()
             
             if sample and tank:
-                # Get battery temperature (critical for throttling)
+                # Get key temperatures
                 battery = sample.zones.get(ThermalZone.BATTERY, 0.0)
+                cpu_big = sample.zones.get(ThermalZone.CPU_BIG, 0.0)
+                cpu_little = sample.zones.get(ThermalZone.CPU_LITTLE, 0.0)
                 
                 # Display current status
                 print(f"[{i+1:2d}s] Battery: {battery:.1f}°C | "
-                      f"State: {tank.state.name:8s} | "
-                      f"Throttle: {'YES' if tank.should_throttle else 'NO'}")
+                      f"CPU_BIG: {cpu_big:.1f}°C | "
+                      f"CPU_LIT: {cpu_little:.1f}°C")
                 
-                # Show thermal budget
-                if tank.thermal_budget < 300:  # Less than 5 min
-                    print(f"       ⚠️  Budget: {tank.thermal_budget:.0f}s | "
-                          f"Cooldown: {tank.cooldown_needed:.0f}s")
+                # Show tank status - dual throttle conditions
+                throttle_icon = "🛑" if tank.should_throttle else "✅"
+                print(f"      {throttle_icon} Throttle: {tank.should_throttle} | "
+                      f"Reason: {tank.throttle_reason.name}")
                 
-                # Show prediction if available
+                # Show velocities (regime change detection)
+                if abs(tank.cpu_big_velocity) > 0.01 or abs(tank.cpu_little_velocity) > 0.01:
+                    big_warn = "⚠️" if tank.cpu_big_velocity > 1.0 else ""
+                    lit_warn = "⚠️" if tank.cpu_little_velocity > 1.0 else ""
+                    print(f"      📈 CPU_BIG vel: {tank.cpu_big_velocity:+.3f}°C/s {big_warn}")
+                    print(f"      📈 CPU_LIT vel: {tank.cpu_little_velocity:+.3f}°C/s {lit_warn}")
+                
+                # Show headroom
+                if tank.headroom_seconds < 300:  # Less than 5 min
+                    print(f"      ⚠️  Headroom: {tank.headroom_seconds:.0f}s")
+                
+                # Show prediction
                 if prediction:
                     pred_battery = prediction.predicted_temps.get(ThermalZone.BATTERY, 0.0)
-                    print(f"       Predicted (+30s): {pred_battery:.1f}°C | "
+                    print(f"      Predicted (+30s): Battery {pred_battery:.1f}°C | "
                           f"Confidence: {prediction.confidence:.0%}")
+                
+                print()  # Blank line between updates
             
             await asyncio.sleep(1)
     
     except KeyboardInterrupt:
-        print("\n\n⚠️  Interrupted by user")
+        print("\n⚠️  Interrupted by user")
     
     finally:
-        # Stop monitoring
         print("\n🛑 Stopping monitoring...")
         await thermal.stop()
-        print("✅ Monitoring stopped.\n")
+        print("✅ Done.\n")
         
-        # Show statistics
+        # Final stats
         stats = thermal.get_statistics()
         print("📊 Statistics:")
-        print(f"   Runtime: {stats.get('runtime_seconds', 0):.0f}s")
-        print(f"   Samples: {stats.get('total_samples', 0)}")
-        print(f"   Predictions: {stats.get('total_predictions', 0)}")
+        print(f"   Samples: {stats.get('samples_collected', 0)}")
+        print(f"   Predictions: {stats.get('predictions_made', 0)}")
+        print(f"   State: {thermal.current_state.name}")
         
-        # Show final tank status
+        # Final tank status
         tank = thermal.get_tank_status()
         if tank:
-            print(f"\n🔥 Final Status:")
-            print(f"   Battery: {tank.battery_temp_current:.1f}°C")
-            print(f"   Peak: {tank.peak_temp:.1f}°C")
-            print(f"   State: {tank.state.name}")
+            print(f"\n🔥 Final Tank Status:")
+            print(f"   Battery: {tank.battery_temp_current:.1f}°C → {tank.battery_temp_predicted:.1f}°C")
+            print(f"   Throttle: {tank.should_throttle} ({tank.throttle_reason.name})")
             print(f"   Cooling rate: {tank.cooling_rate:+.3f}°C/s")
+            print(f"   Headroom: {tank.headroom_seconds:.0f}s")
 
 if __name__ == "__main__":
     asyncio.run(main())
