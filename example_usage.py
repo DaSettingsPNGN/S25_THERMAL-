@@ -6,7 +6,7 @@ Copyright (c) 2025 PNGN-Tec LLC
 
 Real thermal monitoring showing dual-condition throttle system:
 - Battery temperature prediction
-- CPU velocity spike detection
+- CPU velocity spike detection (>3.0°C/s)
 - Observed peak predictions for throttled zones
 """
 
@@ -44,8 +44,8 @@ async def main():
                 
                 # Show velocities (regime change detection)
                 if abs(tank.cpu_big_velocity) > 0.01 or abs(tank.cpu_little_velocity) > 0.01:
-                    big_warn = "⚠️" if tank.cpu_big_velocity > 1.0 else ""
-                    lit_warn = "⚠️" if tank.cpu_little_velocity > 1.0 else ""
+                    big_warn = "⚠️" if tank.cpu_big_velocity > 3.0 else ""
+                    lit_warn = "⚠️" if tank.cpu_little_velocity > 3.0 else ""
                     print(f"      📈 CPU_BIG vel: {tank.cpu_big_velocity:+.3f}°C/s {big_warn}")
                     print(f"      📈 CPU_LIT vel: {tank.cpu_little_velocity:+.3f}°C/s {lit_warn}")
                 
