@@ -1252,8 +1252,6 @@ class ZonePhysicsEngine:
             P_display = DISPLAY_POWER_MIN + (DISPLAY_POWER_MAX - DISPLAY_POWER_MIN) * brightness_factor
         else:
             P_display = (DISPLAY_POWER_MIN + DISPLAY_POWER_MAX) / 2.0
-        else:
-            P_display = DISPLAY_POWER_OFF
         
         # 3. Network power (modem gets this, subtract from total)
         network_type_name = current_sample.network.name if hasattr(current_sample.network, 'name') else 'UNKNOWN'
