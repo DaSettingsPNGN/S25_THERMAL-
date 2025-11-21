@@ -1,133 +1,97 @@
-# 🔥🐧🔥 v2.25 - Dual-Throttle + Observed Peak Prediction
+# 🔥🐧🔥 Release Notes - S25+ Thermal Intelligence
 
-**Major update:** Dual-condition throttle system (battery temp + CPU velocity) and empirical peak predictions for throttled regimes.
+**Physics-based thermal management with dual-condition throttle detection**
 
-**Why this exists:** Running production workloads on flagship phones instead of paying for cloud servers. Mobile computing with thermal intelligence to prevent Samsung's aggressive throttling.
-
----
-
-## The Problem
-
-1. **Physics breaks when throttled** - Model under-predicted by -30 to -60°C when components hit throttle temps
-2. **No early warning for regime changes** - Battery (τ=540s) reacts slowly, CPUs (τ=14-19s) spike first
-3. **Wrong throttle assumptions** - Thought CPU_BIG throttled at 60-65°C, actually starts at 45°C
-
-**Result:** Catastrophic prediction failures during workload spikes.
+Validated over 152k predictions (6.25 hours continuous operation):
+- Overall: 0.58°C MAE (transients filtered), 0.47°C MAE (steady-state)  
+- Battery: 0.24°C MAE
+- Stress test: 1.23°C MAE recovery tracking at 95°C+ CPU temps
 
 ---
 
-## The Solution
+## System Design
 
-### 1. Dual-Condition Throttle
+### Dual-Condition Throttle
 
-**Condition 1: Battery Temperature (existing)**
-```python
-if battery_predicted >= 38.5°C:
-    throttle_reason = BATTERY_TEMP
-```
+**Problem:** Single-condition (battery temp) had blind spot for regime changes.
 
-**Condition 2: CPU Velocity Spike (NEW)**
-```python
-if cpu_big_velocity > 3.0°C/s or cpu_little_velocity > 3.0°C/s:
-    throttle_reason = CPU_VELOCITY
-```
+**Solution:**
+1. **Battery temperature** - Predicts heating from sustained load (τ=210s)
+2. **CPU velocity** - Detects regime changes (>3.0°C/s indicates workload spike)
 
-**Why:** Physics can't predict discontinuities. Velocity >3.0°C/s indicates regime change (workload spike, thermal runaway). Throttle immediately before model breaks.
+Combined approach catches both slow battery heating and fast CPU spikes.
 
-**Validation data:**
-- Normal velocity: <0.4°C/s (P90)
-- Danger threshold: 3.0°C/s (high threshold for real regime changes)
-- Max observed: CPU_BIG 9.5°C/s, CPU_LITTLE 14.0°C/s
+### Observed Peak Prediction
 
-### 2. Observed Peak Prediction
-
-**Instead of physics when throttled:**
-```python
-if current_temp >= throttle_start:
-    predicted_temp = observed_peak  # From validation data
-    # Skip Newton's law - it's wrong in this regime
-```
+When zones reach throttle temperatures, physics breaks down (model assumes constant power, but throttling changes power mid-flight). Solution: use empirical data.
 
 **Observed peaks from validation:**
-- CPU_BIG: 79.1°C (starts throttling at 45°C)
-- CPU_LITTLE: 93.4°C (starts throttling at 48°C)
-- GPU: 58.1°C (starts throttling at 38°C)
-- MODEM: 59.7°C (starts throttling at 40°C)
+- CPU_BIG: 81.0°C (starts throttling at 45°C)
+- CPU_LITTLE: 94.0°C (starts throttling at 48°C)  
+- GPU: 61.0°C (starts throttling at 38°C)
+- MODEM: 62.0°C (starts throttling at 40°C)
 
-**Why:** Model assumes constant power. Throttling changes power mid-flight, breaking the model. Use empirical data instead.
-
-### 3. Corrected Throttle Curves
-
-**Reality vs assumptions:**
-```
-Component    | Old Start | New Start | Observed Peak
--------------|-----------|-----------|---------------
-CPU_BIG      | 60-65°C   | 45°C      | 79.1°C
-CPU_LITTLE   | 75°C      | 48°C      | 93.4°C
-GPU          | 40-55°C   | 38°C      | 58.1°C
-MODEM        | 38°C      | 40°C      | 59.7°C
-```
-
-**Source:** Validation data + Snapdragon 8 Elite research (mainstream phones throttle to <30% of peak to maintain <44°C touch temp).
+When `current_temp >= throttle_start`, predict observed_peak instead of using Newton's law.
 
 ---
 
-## Results
+## Thermal Constants
 
-**Prediction accuracy:**
-- Normal regime: **0.5°C MAE** (CPUs that spike 20°C/second!)
-- Battery: **0.04°C MAE** (τ=540s, highly predictable)
-- Throttled regime: Use observed peaks → no more -30 to -60°C errors
+**Measured from hardware:**
+- CPU_BIG: τ=50s, thermal mass=20 J/K
+- CPU_LITTLE: τ=60s, thermal mass=40 J/K
+- GPU: τ=95s, thermal mass=40 J/K
+- BATTERY: τ=210s, thermal mass=75 J/K
+- MODEM: τ=80s, thermal mass=35 J/K
+- CHASSIS: τ=100s, thermal mass=40 J/K
 
-**Throttle detection:**
-- Battery-based: Prevents Samsung's 40-42°C throttle
-- Velocity-based: Catches regime changes before physics breaks
-- Combined: Proactive protection from two independent failure modes
-
-**Production:** 24/7 Discord bot, 600+ members, Samsung S25+, zero thermal shutdowns.
-
-**Mobile computing:** Flagship phone hardware (Snapdragon 8 Elite, 12GB RAM) running production workloads. No root access, no cloud costs.
+**Sampling:**
+- 1s interval (THERMAL_SAMPLE_INTERVAL = 1.0)
+- 30s prediction horizon
+- Minimum 3 samples before predictions enabled
 
 ---
 
-## API Changes
+## API
 
-**ThermalTankStatus enhanced:**
+**ThermalTankStatus structure:**
 ```python
 @dataclass
 class ThermalTankStatus:
     battery_temp_current: float
     battery_temp_predicted: float
     should_throttle: bool
-    throttle_reason: ThrottleReason      # NEW: Why throttling
+    throttle_reason: ThrottleReason      # Why throttling
     headroom_seconds: float
     cooling_rate: float
-    cpu_big_velocity: float              # NEW: Regime detector
-    cpu_little_velocity: float           # NEW: Regime detector
+    cpu_big_velocity: float              # Regime detector
+    cpu_little_velocity: float           # Regime detector
 ```
 
-**ThrottleReason enum (NEW):**
+**ThrottleReason enum:**
 ```python
 class ThrottleReason(Enum):
     NONE = auto()           # Safe
     BATTERY_TEMP = auto()   # Battery too hot
-    CPU_VELOCITY = auto()   # Regime change
+    CPU_VELOCITY = auto()   # Regime change (>3.0°C/s)
     BOTH = auto()           # Both triggered
+```
+
+**Key constants:**
+```python
+THERMAL_PREDICTION_HORIZON = 30.0       # seconds
+THERMAL_SAMPLE_INTERVAL = 1.0           # 1s sampling
+TANK_THROTTLE_TEMP = 38.5               # Battery °C (2° safety margin)
+CPU_VELOCITY_DANGER = 3.0               # °C/s regime change threshold
 ```
 
 ---
 
-## Quick Start
+## Usage
 
-```bash
-pip install numpy
-python example_usage.py
-```
-
-**Basic usage:**
 ```python
 import asyncio
-from s25_thermal import create_thermal_intelligence
+from s25_thermal import create_thermal_intelligence, ThrottleReason
 
 async def main():
     thermal = create_thermal_intelligence()
@@ -135,16 +99,19 @@ async def main():
     
     tank = thermal.get_tank_status()
     
-    # Dual-condition check
     if tank.should_throttle:
-        print(f"Throttling: {tank.throttle_reason.name}")
-        
         if tank.throttle_reason == ThrottleReason.CPU_VELOCITY:
-            print(f"Regime change: CPU_BIG {tank.cpu_big_velocity:+.3f}°C/s")
+            # Regime change - wait for stabilization
+            await asyncio.sleep(30)
         elif tank.throttle_reason == ThrottleReason.BATTERY_TEMP:
-            print(f"Battery hot: {tank.battery_temp_current:.1f}°C")
+            # Battery hot - wait for cooling
+            await asyncio.sleep(tank.headroom_seconds)
+        else:
+            # Both conditions - wait longer
+            await asyncio.sleep(60)
     else:
-        print(f"Safe - headroom: {tank.headroom_seconds:.0f}s")
+        # Safe to operate
+        await execute_work()
     
     await thermal.stop()
 
@@ -153,113 +120,18 @@ asyncio.run(main())
 
 ---
 
-## What's Included
-
-- `s25_thermal.py` - Complete system (2478 lines, single-file for mobile)
-- `example_usage.py` - Working demo with dual-throttle
-- `README.md` - Full documentation + validation methodology
-- `CHANGELOG.md` - Version history
-
----
-
-## Breaking Changes
-
-**ThermalTankStatus structure changed:**
-- Added `throttle_reason: ThrottleReason`
-- Added `cpu_big_velocity: float`
-- Added `cpu_little_velocity: float`
-
-**If upgrading from v2.24:** Update code accessing `ThermalTankStatus` to handle new fields.
-
----
-
 ## Requirements
 
-- **Python 3.8+**
-- **numpy** (for physics calculations)
-- **Termux + termux-api** (for Android deployment)
-
-✅ Tested on Samsung Galaxy S25+ (Snapdragon 8 Elite for Galaxy)
-
-**Non-rooted** - Keep your warranty. Uses sysfs reads via termux-api.
-
----
-
-## Technical Details
-
-**Why dual-condition?**
-
-Single condition (battery temp) had blind spot: regime changes. Battery τ=540s means it reacts slowly. CPUs τ=14-19s react fast. When workload spikes, CPUs hit 70-90°C before battery reaches 38.5°C. Physics model can't predict this.
-
-Solution: Monitor CPU velocities. >3.0°C/s = regime change = throttle immediately.
-
-**Why observed peaks?**
-
-Physics assumes constant power: `T = T_amb + (P·R/k)·(...)`
-
-Throttling changes P mid-prediction, breaking the model. Instead of fighting this, use empirical data: "When CPU_BIG is throttled, it peaks at 79.1°C."
-
-**Validation:** 21,973 predictions, 7 zones, 30s horizon, 53 minutes continuous operation. Found:
-- Throttling starts 15-30°C earlier than assumed
-- Max errors when hot but stable (already throttled)
-- Velocities spike to 9.5-14°C/s during regime changes
-- Pure Newton's law achieves 0.5°C MAE without any adaptation
-
-**Why single file?**
-
-Mobile deployment on Termux. Python's import system requires filesystem operations for each module. Android's filesystem layers add latency. Every I/O operation consumes battery and generates heat. Single-file design reduces startup latency and thermal load. This is constraint-driven engineering for the actual deployment environment.
-
----
-
-## Migration Guide
-
-**v2.24 → v2.25:**
-
-Old code:
-```python
-tank = thermal.get_tank_status()
-if tank.should_throttle:
-    await asyncio.sleep(30)
-```
-
-New code (handles both conditions):
-```python
-tank = thermal.get_tank_status()
-if tank.should_throttle:
-    if tank.throttle_reason == ThrottleReason.CPU_VELOCITY:
-        # Regime change - wait for stabilization
-        await asyncio.sleep(30)
-    elif tank.throttle_reason == ThrottleReason.BATTERY_TEMP:
-        # Battery hot - wait longer
-        await asyncio.sleep(tank.headroom_seconds)
-    else:
-        # Both conditions - wait for both to clear
-        await asyncio.sleep(60)
-```
-
----
-
-## The Story
-
-I didn't want to pay for a server. I have a flagship phone—S25+ with Snapdragon 8 Elite and 12GB RAM. I wanted to run intensive computational workloads as a production server on my phone.
-
-**The problem:** Samsung's reactive thermal throttling at 42°C crashes performance by 50%, creating thermal spirals.
-
-**The solution:** Never reach 42°C. Predict thermal events using physics, throttle proactively.
-
-**The result:** Sub-degree prediction accuracy, zero thermal shutdowns, production deployment on battery-powered hardware.
-
-This proves you can run production workloads on mobile hardware if you understand the physics and respect the constraints.
+- Python 3.8+
+- numpy ≥1.20.0
+- Samsung Galaxy S25+ (Snapdragon 8 Elite) or compatible device
 
 ---
 
 ## License
 
-MIT License
-
-Copyright (c) 2025 PNGN-Tec LLC  
-Author: Jesse Vogeler-Wunsch (@DaSettingsPNGN)
+MIT License - Copyright (c) 2025 PNGN-Tec LLC
 
 ---
 
-**Dual-condition throttle + empirical peak predictions = robust thermal management on mobile hardware.** 🔥
+**Physics-based thermal management with dual-condition throttle detection.** 🔥

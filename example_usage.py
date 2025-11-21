@@ -4,10 +4,10 @@
 ===========================================
 Copyright (c) 2025 PNGN-Tec LLC
 
-Real thermal monitoring showing dual-condition throttle system:
+Demonstrates dual-condition throttle system:
 - Battery temperature prediction
-- CPU velocity spike detection (>3.0°C/s)
-- Observed peak predictions for throttled zones
+- CPU velocity spike detection
+- Multi-zone thermal monitoring
 """
 
 import asyncio

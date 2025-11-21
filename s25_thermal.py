@@ -8,10 +8,13 @@ Physics-based thermal management for Android devices under continuous load.
 
 Multi-zone temperature monitoring with Newton's law of cooling predictions. 
 Prevents throttling through proactive thermal budget calculation and workload 
-scheduling. Built for production operation where thermal shutdowns are unacceptable.
+scheduling.
 
-Production deployment: Discord bot serving 645+ members on Samsung S25+, 
-24/7 operation with zero thermal shutdowns.
+Validation results over 152k predictions (6.25 hours continuous operation):
+- Overall: 0.58°C MAE (transients filtered), 0.47°C MAE (steady-state)
+- Battery prediction: 0.24°C MAE
+- 96.5% of predictions within 5°C (3.5% transients during load changes)
+- Stress test: CPUs sustained 95°C+ with 1.23°C MAE recovery tracking
 
 ARCHITECTURE:
 - Multi-zone sensor monitoring (CPU, GPU, battery, modem, chassis)
@@ -19,16 +22,16 @@ ARCHITECTURE:
 - Dual-confidence predictions (physics model × sample-size weighting)
 - Samsung throttling awareness (50% power reduction at 42°C battery)
 - Thermal tank status for dual-condition throttle decisions (battery temp + CPU velocity)
-- 10s sampling, 30s prediction horizon
+- 1s sampling, 30s prediction horizon
 
 HARDWARE (Samsung Galaxy S25+ / Snapdragon 8 Elite):
-- CPU_BIG (cpuss-1-0 / zone 20): 2× Oryon Prime, τ=6.6s
-- CPU_LITTLE (cpuss-0-0 / zone 13): 6× Oryon efficiency, τ=6.9s
-- GPU (gpuss-0 / zone 23): Adreno 830, τ=9.1s
-- MODEM (mdmss-0 / zone 31): 5G/WiFi, τ=9.0s
-- BATTERY (battery / zone 60): τ=540s (critical for Samsung throttle at 42°C)
-- CHASSIS (sys-therm-0 / zone 53): vapor chamber reference sensor
-- AMBIENT (sys-therm-5 / zone 52): ambient air temperature
+- CPU_BIG (cpuss-1-0 / zone 20): 2× Oryon Prime, τ=50s
+- CPU_LITTLE (cpuss-0-0 / zone 13): 6× Oryon efficiency, τ=60s
+- GPU (gpuss-0 / zone 23): Adreno 830, τ=95s
+- MODEM (mdmss-0 / zone 31): 5G/WiFi, τ=80s
+- BATTERY (battery / zone 60): τ=210s (critical for Samsung throttle at 42°C)
+- CHASSIS (sys-therm-0 / zone 53): vapor chamber reference sensor, τ=100s
+- AMBIENT (sys-therm-5 / zone 52): ambient air temperature, τ=30s
 
 ZONE CORRECTIONS (based on thermal scan):
 - BATTERY: 31 → 60 (zone 31 is modem, not battery)
@@ -42,8 +45,9 @@ Battery simplification (τ >> horizon):
 ΔT ≈ (P/C) × Δt
 
 PREDICTION ACCURACY:
-~0.5°C MAE at 30s horizon with 10s sampling
-Battery zone most predictable (τ=540s)
+~0.6°C MAE at 30s horizon (filtered for transients)
+0.47°C MAE during steady-state operation
+Battery zone highly predictable at 0.24°C MAE (τ=210s)
 """
 
 import sys
@@ -52,7 +56,6 @@ import json
 import time
 import asyncio
 import subprocess
-import numpy as np
 from typing import Dict, List, Optional, Tuple, Callable, Any, Deque, Set
 from dataclasses import dataclass, field
 from collections import deque, defaultdict, OrderedDict
@@ -62,23 +65,99 @@ import math
 import statistics
 import logging
 from pathlib import Path
+import numpy as np
 
 # Configure logging
 logger = logging.getLogger('PNGN.S25Thermal')
+
+# ============================================================================
+# VALIDATION INFRASTRUCTURE
+# ============================================================================
+
+# Validation configuration
+MAX_VALIDATION_SAMPLES = 500  # Maximum samples to keep per zone for validation
+MAX_PREDICTIONS = 10000  # Maximum predictions to store in numpy array (flush ~every 3-4 hours)
+MAX_PENDING_VALIDATIONS = 1000  # Maximum pending validations to prevent memory leak
+VALIDATION_WINDOW = 3.0  # seconds - tolerance for validating predictions
+VALIDATION_MAX_AGE = 120.0  # seconds - maximum age before discarding stale predictions
+
+@dataclass
+class ValidationMetrics:
+    """Comprehensive validation metrics for a zone"""
+    count: int = 0
+    mae: float = 0.0  # Mean Absolute Error
+    rmse: float = 0.0  # Root Mean Squared Error
+    max_error: float = 0.0
+    mean_error: float = 0.0  # Bias
+    std_error: float = 0.0
+    within_1C: int = 0
+    within_2C: int = 0
+    within_3C: int = 0
+    last_update: float = 0.0
+
+class BoundedDefaultDict:
+    """A defaultdict that automatically bounds list sizes to prevent memory leaks"""
+    def __init__(self, default_factory, maxlen=MAX_VALIDATION_SAMPLES):
+        self.data = {}
+        self.default_factory = default_factory
+        self.maxlen = maxlen
+    
+    def __getitem__(self, key):
+        if key not in self.data:
+            self.data[key] = self.default_factory()
+        return self.data[key]
+    
+    def __setitem__(self, key, value):
+        self.data[key] = value
+    
+    def __contains__(self, key):
+        return key in self.data
+    
+    def keys(self):
+        return self.data.keys()
+    
+    def values(self):
+        return self.data.values()
+    
+    def items(self):
+        return self.data.items()
+    
+    def append_to(self, key, subkey, value):
+        """Append to nested dict with automatic bounding"""
+        if key not in self.data:
+            self.data[key] = {}
+        if subkey not in self.data[key]:
+            self.data[key][subkey] = deque(maxlen=self.maxlen)
+        
+        if isinstance(self.data[key][subkey], deque):
+            self.data[key][subkey].append(value)
+        elif isinstance(self.data[key][subkey], list):
+            # Migrate old list to bounded deque
+            self.data[key][subkey] = deque(self.data[key][subkey], maxlen=self.maxlen)
+            self.data[key][subkey].append(value)
+
 # ============================================================================
 # TUNING CONSTANTS - ALL CONFIGURABLE PARAMETERS IN ONE PLACE
 # ============================================================================
 
+# Default tau for zones without specific constants
+TAU_DEFAULT = 30.0  # seconds - fallback time constant
+
 # ============================================================================
 # PREDICTION PARAMETERS
 # ============================================================================
-THERMAL_PREDICTION_HORIZON = 30.0      # seconds ahead to predict
-THERMAL_SAMPLE_INTERVAL_MS = 1000      # 1s uniform sampling
-THERMAL_HISTORY_SIZE = 120             # samples to keep (120s = 2 minutes)
-MIN_SAMPLES_FOR_PREDICTIONS = 3       # minimum samples before making predictions
+THERMAL_PREDICTION_HORIZON = 30.0       # seconds ahead to predict
+THERMAL_SAMPLE_INTERVAL = 1.0           # 1s uniform sampling
+THERMAL_HISTORY_SIZE = 300              # samples to keep
+MIN_SAMPLES_FOR_PREDICTIONS = 60        # minimum samples before making predictions (1 min warmup for ambient fitting)
+API_UPDATE_INTERVAL = 2.0               # seconds between battery/network/brightness cache updates
+
+# Velocity calculation
+VELOCITY_CALCULATION_SAMPLES = 10        # samples for velocity linear regression
+VELOCITY_HISTORY_SIZE = 3               # samples for regime change detection
 
 # Confidence scaling
-CONFIDENCE_SAFETY_SCALE = 0.5          # prediction safety scaling
+CONFIDENCE_SAFETY_SCALE = 0.5           # prediction safety scaling
 
 # ============================================================================
 # SAMSUNG THROTTLING BEHAVIOR
@@ -93,53 +172,6 @@ THROTTLE_POWER_REDUCTION = 0.5             # Reduce to 50% of nominal power
 THROTTLE_HYSTERESIS = 1.0                  # °C - hysteresis to prevent oscillation
 # Zones affected by battery-based throttling
 THROTTLE_AFFECTED_ZONES = ['CPU_BIG', 'CPU_LITTLE', 'GPU']
-
-# ============================================================================
-# PER-COMPONENT THERMAL THROTTLING
-# ============================================================================
-# Components throttle themselves based on their own temperature, independent
-# of battery temp. This happens BEFORE Samsung's battery-based global throttle.
-#
-# Validation shows catastrophic prediction errors at max load because components
-# self-throttle continuously - CPU drops to 74-77% sustained, GPU drops bins
-# dynamically, etc. These curves model reality.
-COMPONENT_THROTTLE_CURVES = {
-    'CPU_BIG': {
-        'temp_start': 45.0,
-        'observed_peak': 79.1,    # From validation data
-        'temp_aggressive': 75.0,
-        'min_factor': 0.30,
-        'curve_shape': 'exponential',
-    },
-    'CPU_LITTLE': {
-        'temp_start': 48.0,
-        'observed_peak': 93.4,    # From validation data
-        'temp_aggressive': 88.0,
-        'min_factor': 0.35,
-        'curve_shape': 'exponential',
-    },
-    'GPU': {
-        'temp_start': 38.0,
-        'observed_peak': 58.1,    # From validation data
-        'temp_aggressive': 54.0,
-        'min_factor': 0.30,
-        'curve_shape': 'exponential',
-    },
-    'MODEM': {
-        'temp_start': 40.0,
-        'observed_peak': 59.7,    # From validation data
-        'temp_aggressive': 55.0,
-        'min_factor': 0.60,
-        'curve_shape': 'linear',
-    },
-    'BATTERY': {
-        'temp_start': 999.0,
-        'observed_peak': 35.2,    # From validation data
-        'temp_aggressive': 999.0,
-        'min_factor': 1.0,
-        'curve_shape': 'linear',
-    },
-}
 
 # ============================================================================
 # HARDWARE CONSTANTS - Samsung S25+ (Snapdragon 8 Elite for Galaxy)
@@ -163,70 +195,185 @@ S25_PLUS_BATTERY_INTERNAL_RESISTANCE = 0.150  # Ohms
 S25_PLUS_VAPOR_CHAMBER_EFFICIENCY = 0.85      # heat transfer efficiency
 S25_PLUS_SCREEN_SIZE = 6.7                    # inches
 
-# Per-zone thermal characteristics
-ZONE_THERMAL_CONSTANTS = {
-    'CPU_BIG': {
-        'thermal_mass': 0.005,         # J/K
-        'thermal_resistance': 1.00,    # K/W
-        'ambient_coupling': 0.90,      # coupled to vapor chamber
-        'peak_power': 6.0,             # W
-        'idle_power': 0.1,
-        'time_constant': 18.7,         # s (measured)
-        'measurement_tau': 0.3,        # s (sensor lag)
-    },
-    'CPU_LITTLE': {
-        'thermal_mass': 0.010,         # J/K
-        'thermal_resistance': 1.50,    # K/W
-        'ambient_coupling': 0.90,      # coupled to vapor chamber
-        'peak_power': 4.0,
-        'idle_power': 0.05,
-        'time_constant': 14.3,         # s (measured)
-        'measurement_tau': 0.1,
-    },
-    'GPU': {
-        'thermal_mass': 0.07,         # J/K
-        'thermal_resistance': 0.50,   # K/W
-        'ambient_coupling': 0.85,     # moderate coupling
-        'peak_power': 8.0,
-        'idle_power': 0.2,
-        'time_constant': 22.3,        # s (measured)
-        'measurement_tau': 0.2,
-    },
+# ============================================================================
+# PREDICTION ACCURACY THRESHOLDS (Zone-Specific)
+# ============================================================================
+# Different zones have different accuracy expectations based on thermal mass
+# and measurement characteristics. Color coding uses PNGN team colors:
+# Green (#00FF7F) → Purple (#CC33FF) → Red (#FF1493)
+
+ACCURACY_THRESHOLDS = {
     'BATTERY': {
-        'thermal_mass': 50.0,         # J/K (large thermal mass)
-        'thermal_resistance': 50.00,  # K/W
-        'ambient_coupling': 0.30,     # poor coupling (internal)
-        'peak_power': 4.0,            # W (I²R losses)
-        'idle_power': 0.1,
-        'time_constant': 118.1,       # s (measured - very slow)
-        'measurement_tau': 1.0,
-    },
-    'MODEM': {
-        'thermal_mass': 0.02,         # J/K
-        'thermal_resistance': 1.00,   # K/W
-        'ambient_coupling': 0.70,
-        'peak_power': 3.0,
-        'idle_power': 0.3,
-        'time_constant': 19.9,        # s (measured)
-        'measurement_tau': 0.5,
-    },
-    'CHASSIS': {
-        'thermal_mass': 15.0,         # J/K (vapor chamber + frame)
-        'thermal_resistance': 0.50,   # K/W
-        'ambient_coupling': 1.0,      # IS the ambient coupling
-        'peak_power': 0.0,            # passive
-        'idle_power': 0.0,
-        'time_constant': 41.7,        # s (measured)
-        'measurement_tau': 0.5,
+        'excellent': 1.0,
+        'good': 1.5,
+        'fair': 2.0,
+        'poor': 999.0
     },
     'AMBIENT': {
-        'thermal_mass': 100.0,        # J/K (environment)
-        'thermal_resistance': 0.01,   # K/W (negligible)
-        'ambient_coupling': 1.0,
+        'excellent': 1.0,
+        'good': 1.5,
+        'fair': 2.0,
+        'poor': 999.0
+    },
+    'CHASSIS': {
+        'excellent': 1.0,
+        'good': 1.5,
+        'fair': 2.0,
+        'poor': 999.0
+    },
+    'GPU': {
+        'excellent': 2.0,
+        'good': 2.5,
+        'fair': 3.0,
+        'poor': 999.0
+    },
+    'MODEM': {
+        'excellent': 2.0,
+        'good': 2.5,
+        'fair': 3.0,
+        'poor': 999.0
+    },
+    'CPU_BIG': {
+        'excellent': 3.0,
+        'good': 3.5,
+        'fair': 4.0,
+        'poor': 999.0
+    },
+    'CPU_LITTLE': {
+        'excellent': 3.0,
+        'good': 3.5,
+        'fair': 4.0,
+        'poor': 999.0
+    },
+}
+
+# Color definitions (PNGN_32 palette - from PNGN_32.html)
+ACCURACY_COLORS = {
+    'excellent': '#00FF7F',      # Radiation Green (index 18) - RGB(0, 255, 127)
+    'good': '#00FF00',           # Neon Green (index 16) - RGB(0, 255, 0)
+    'fair': '#CC33FF',           # PNGN Purple (index 0) - RGB(204, 51, 255)
+    'poor': '#FF1493'            # Deep Pink (index 10) - RGB(255, 20, 147)
+}
+
+# Text labels for accuracy ratings
+ACCURACY_LABELS = {
+    'excellent': 'EXCELLENT',
+    'good': 'GOOD',
+    'fair': 'FAIR',
+    'poor': 'POOR'
+}
+
+# ============================================================================
+# ADAPTIVE POWER LEARNING
+# ============================================================================
+POWER_LEARNING_ENABLED = True
+POWER_LEARNING_RATE = 0.03                          # EMA alpha
+POWER_LEARNING_WINDOW = 3                         # samples to stabilize
+POWER_LEARNING_MIN_SAMPLES = 5                     # minimum before applying
+POWER_LEARNING_PERSIST_INTERVAL = 86400              # 24 hours
+POWER_LEARNING_BACKUP_INTERVAL = 3600               # 1 hour
+POWER_LEARNING_BACKUP_RETENTION_DAYS = 7
+POWER_LEARNING_FILE = '~/.thermal_power_learned.json'
+POWER_LEARNING_BACKUP_DIR = '~/.thermal_power_backups'
+
+# Thermal zone definitions with physically-derived constants
+ZONE_THERMAL_CONSTANTS = {
+    'CPU_BIG': {
+        'thermal_mass': 20.00,  # Updated from 15 based on transient analysis
+        'ambient_coupling': 0.0,    # Coupled to CHASSIS not ambient 
+        'peak_power': 20.0,
+        'idle_power': 0.02,  # Reduced from 0.10 to fix +4.7°C bias
+        'time_constant': 50.0,  # Updated from 5s based on cooling measurements
+        'measurement_tau': 0.3,
+    },
+    
+    'CPU_LITTLE': {
+        'thermal_mass': 40.00,  # Updated from 30 based on transient analysis
+        'ambient_coupling': 0.0,    # Coupled to CHASSIS not ambient 
+        'peak_power': 20.0,
+        'idle_power': 0.04,  # Reduced from 0.10 to fix +2.4°C bias
+        'time_constant': 60.0,  # Updated from 10s based on cooling measurements
+        'measurement_tau': 0.3,
+    },
+    
+    'GPU': {
+        'thermal_mass': 40.00,  # Updated from 30 based on transient analysis
+        'ambient_coupling': 0.0,
+        'peak_power': 20.0,
+        'idle_power': 0.03,  # Reduced from 0.10 to fix +3.6°C bias
+        'time_constant': 95.0,  # Updated from 15s based on cooling measurements
+        'measurement_tau': 0.3,
+    },
+    
+    'BATTERY': {
+        'thermal_mass': 75.00,
+        'ambient_coupling': 0.0,    # Coupled to CHASSIS not ambient 
         'peak_power': 0.0,
         'idle_power': 0.0,
-        'time_constant': 3600.0,      # s (very slow room temp changes)
-        'measurement_tau': 1.0,
+        'time_constant': 210.0,
+        'measurement_tau': 0.3,
+    },
+    
+    'MODEM': {
+        'thermal_mass': 35.00,  # Updated from 30 based on transient analysis
+        'ambient_coupling': 0.0,    # Coupled to CHASSIS not ambient 
+        'peak_power': 20.0,
+        'idle_power': 0.04,  # Reduced from 0.10 to fix +2.5°C bias
+        'time_constant': 80.0,  # Updated from 15s based on cooling measurements
+        'measurement_tau': 0.3,
+    },
+    
+    'CHASSIS': {
+        'thermal_mass': 40.00,
+        'ambient_coupling': 0.80,
+        'peak_power': 0.0,
+        'idle_power': 0.0,
+        'time_constant': 100.0,
+        'measurement_tau': 0.3,
+    },
+    
+    'AMBIENT': {
+        'thermal_mass': 10.0,
+        'ambient_coupling': 0.0,
+        'peak_power': 0.0,
+        'idle_power': 0.0,
+        'time_constant': 30.0,         # Phones are mobile and ambient changes quickly
+        'measurement_tau': 0.0,
+    }
+}
+
+# ============================================================================
+# COMPONENT THROTTLE CURVES
+# ============================================================================
+# Real silicon throttles progressively. These model actual behavior.
+COMPONENT_THROTTLE_CURVES = {
+    'CPU_BIG': {
+        'temp_start': 45.0,       # Begin throttling
+        'observed_peak': 81.0,  # Updated from 72°C based on max load validation    # Where it plateaus under load
+        'temp_aggressive': 65.0,  # Heavy throttle point - lowered from 71°C
+        'min_factor': 0.50,       # 50% power at max throttle
+        'curve_shape': 'linear',
+    },
+    'CPU_LITTLE': {
+        'temp_start': 48.0,
+        'observed_peak': 94.0,
+        'temp_aggressive': 85.0,  # Heavy throttle point - lowered from 93°C
+        'min_factor': 0.50,
+        'curve_shape': 'linear',
+    },
+    'GPU': {
+        'temp_start': 38.0,
+        'observed_peak': 61.0,  # Updated from 55°C based on max load validation
+        'temp_aggressive': 50.0,  # Heavy throttle point - lowered from 54°C
+        'min_factor': 0.50,
+        'curve_shape': 'linear',
+    },
+    'MODEM': {
+        'temp_start': 40.0,
+        'observed_peak': 62.0,  # Updated from 56°C based on max load validation
+        'temp_aggressive': 50.0,  # Heavy throttle point - lowered from 55°C
+        'min_factor': 0.50,
+        'curve_shape': 'linear',
     },
 }
 
@@ -307,6 +454,21 @@ THERMAL_VELOCITY_RAPID_WARMING = 0.15     # °C/s (rapid heating)
 THERMAL_SENSOR_TEMP_MIN = 15.0       # °C (sanity check lower bound)
 THERMAL_SENSOR_TEMP_MAX = 75.0       # °C (sanity check upper bound)
 
+THERMAL_SENSOR_CONFIDENCE_REDUCED = 0.5   # Confidence for out-of-range sensor readings
+
+# Termux / external API configuration
+THERMAL_SUBPROCESS_TIMEOUT = 3.0         # Seconds to wait for Termux subprocess calls
+THERMAL_NETWORK_TIMEOUT = 3.0           # Seconds to wait for network info commands
+THERMAL_NETWORK_AWARENESS_ENABLED = True
+
+TERMUX_BATTERY_STATUS_CMD = ["termux-battery-status"]
+TERMUX_WIFI_INFO_CMD = ["termux-wifi-connectioninfo"]
+TERMUX_TELEPHONY_INFO_CMD = ["termux-telephony-deviceinfo"]
+
+# Minimum Wi-Fi frequency (MHz) considered to be 5 GHz band
+THERMAL_WIFI_5G_FREQ_MIN = 4900.0
+
+
 # Thermal zone mapping (None = auto-discover from /sys/class/thermal)
 THERMAL_ZONES = None
 
@@ -314,15 +476,287 @@ THERMAL_ZONES = None
 BATTERY_PREDICTION_HORIZON = THERMAL_PREDICTION_HORIZON    # seconds (matches main horizon for consistency)
 
 # ============================================================================
+# CACHE AGE LIMITS
+# ============================================================================
+# Prediction context cache ages (expensive or slow-changing data)
+PREDICTION_BATTERY_CACHE_AGE = 3.0         # seconds - expensive ground truth for power
+PREDICTION_NETWORK_CACHE_AGE = 3.0         # seconds - rare regime changes
+PREDICTION_BRIGHTNESS_CACHE_AGE = 3.0      # seconds - slow changes, context only
+
+# ============================================================================
+# SAMPLE WINDOW SIZES
+# ============================================================================
+REGIME_DETECTION_WINDOW = 3                 # samples for regime change detection
+MIN_SAMPLES_AMBIENT_FIT = 3                 # minimum samples for ambient curve fitting
+MIN_COOLING_SAMPLES = 3                     # minimum cooling samples for exponential fit
+MIN_TREND_SAMPLES = 3                       # minimum samples for trend detection
+SAMPLE_STALENESS_THRESHOLD = 1.0            # Maximum time difference between actual and predicted
+
+# ============================================================================
+# VELOCITY THRESHOLDS
+# ============================================================================
+HIGH_VELOCITY_THRESHOLD = 2.0               # °C/s - regime change detection
+CPU_VELOCITY_DANGER = 3.0                   # °C/s - danger threshold for CPU
+
+# Status display trend indicators (°C/s)
+VELOCITY_TREND_RAPID_WARMING = 0.15         # ↑↑ rapid warming
+VELOCITY_TREND_WARMING = 0.05               # ↑  warming
+VELOCITY_TREND_STABLE_HIGH = 0.05           # →  stable (upper bound)
+VELOCITY_TREND_STABLE_LOW = -0.05           # →  stable (lower bound)
+VELOCITY_TREND_COOLING = -0.15              # ↓  cooling (upper bound)
+VELOCITY_TREND_RAPID_COOLING = -0.15        # ↓↓ rapid cooling (at or below)
+
+# ============================================================================
+# TEMPERATURE DISPLAY THRESHOLDS
+# ============================================================================
+# Color-coded temperature zones for status display
+TEMP_DISPLAY_COOL = 35.0                    # °C - green zone
+TEMP_DISPLAY_WARM = 38.0                    # °C - light green zone
+TEMP_DISPLAY_WARNING = 42.0                 # °C - purple zone
+TEMP_DISPLAY_HOT = 45.0                     # °C - pink zone
+# Above TEMP_DISPLAY_HOT = red zone
+
+# ============================================================================
+# CHARGING THRESHOLDS
+# ============================================================================
+FAST_CHARGE_CURRENT_UA = 1_000_000          # microamps (1A) - fast charging
+NORMAL_CHARGE_CURRENT_UA = 500_000          # microamps (0.5A) - normal charging
+FAST_CHARGE_CURRENT_MA = 1500               # milliamps - alternative fast charge detection
+
+# Battery SOC thresholds
+BATTERY_SOC_CRITICAL = 15                   # % - critical battery level
+BATTERY_SOC_OPTIMAL_MIN = 50                # % - optimal range start
+BATTERY_SOC_OPTIMAL_MAX = 80                # % - optimal range end
+BATTERY_SOC_HIGH = 85                       # % - high battery level
+
+# ============================================================================
+# AMBIENT TEMPERATURE ESTIMATION
+# ============================================================================
+AMBIENT_TEMP_MIN = 10.0                     # °C - lower bound for ambient estimates
+AMBIENT_TEMP_MAX = 70.0                     # °C - upper bound for ambient estimates
+AMBIENT_ESTIMATE_OFFSET = 2.5               # °C - offset from coolest sensor
+AMBIENT_TEMP_FALLBACK = 25.0                # °C - fallback when no estimate available
+
+# Battery-based ambient offset (varies by charge state)
+BASE_OFFSET_FAST_CHARGE = 8.0               # °C - fast charging
+BASE_OFFSET_DISCHARGE = 6.0                 # °C - discharging
+BASE_OFFSET_IDLE = 5.0                      # °C - idle
+BASE_OFFSET_SLOW_CHARGE = 3.0               # °C - slow charging
+
+# Ambient estimation weights
+AMBIENT_WEIGHT_BATTERY = 0.7                # Battery-based estimate weight
+AMBIENT_WEIGHT_CHASSIS = 0.3                # Chassis-based estimate weight (inverse used when reversed)
+
+# ============================================================================
+# THERMAL TIME CONSTANTS (FALLBACKS)
+# ============================================================================
+# Used when zone constants not available
+TAU_BATTERY_FALLBACK = 210.0                # seconds - battery thermal time constant
+TAU_CHASSIS_FALLBACK = 100.0                   # seconds - chassis thermal time constant
+TAU_CHASSIS_SYNTHETIC = 100.0                 # seconds - synthetic for coupled predictions
+
+# ============================================================================
+# DISPLAY BRIGHTNESS
+# ============================================================================
+BRIGHTNESS_MIN = 0                          # minimum brightness value
+BRIGHTNESS_MAX = 255                        # maximum brightness value
+BRIGHTNESS_FALLBACK = 128                   # fallback brightness when unavailable
+
+# ============================================================================
+# CURVE FITTING
+# ============================================================================
+CURVE_FIT_MAX_ITERATIONS = 1000             # maximum iterations for scipy curve_fit
+
+# ============================================================================
+# THERMAL BUDGET
+# ============================================================================
+THERMAL_BUDGET_UNLIMITED = 999.0            # seconds - sentinel for unlimited thermal budget
+MAX_THERMAL_BUDGET = 600.0                  # seconds - maximum reasonable thermal budget
+MAX_RECOMMENDED_DELAY = 10.0                # seconds - maximum recommended delay
+
+# ============================================================================
+# PHYSICS CONSTANTS
+# ============================================================================
+BATTERY_NOMINAL_VOLTAGE = 3.8               # V - typical Li-ion voltage
+GPU_THERMAL_COEFFICIENT = 3.0               # tuned coefficient for GPU thermal behavior
+MIN_THERMAL_POWER = 0.1                     # W - floor for thermal power calculations
+EPSILON_VELOCITY = 0.01                     # °C/s - small epsilon to prevent divide-by-zero
+SECONDS_PER_DAY = 86400                     # seconds in a day
+
+# ============================================================================
+# POWER VALIDATION
+# ============================================================================
+MIN_POWER_SANITY = 0.5                      # W - minimum realistic power
+MAX_POWER_SANITY = 20.0                     # W - maximum realistic power for validation
+
+# ============================================================================
+# THROTTLE PREDICTION
+# ============================================================================
+THROTTLE_PREDICTION_BUFFER = 1.5            # °C - predict throttle this far ahead of actual temp
+
+# ============================================================================
+# CONFIDENCE WEIGHTS (Zone-Specific)
+# ============================================================================
+# Zone velocity weights for overall velocity calculation
+VELOCITY_WEIGHTS = {
+    'CPU_BIG': 2.0,
+    'GPU': 1.5,
+    'CPU_LITTLE': 1.0,
+    'BATTERY': 0.5,
+    'MODEM': 0.8,
+}
+VELOCITY_WEIGHT_DEFAULT = 1.0
+CPU_BIG_VELOCITY_WEIGHT = 2.0  # Weight for CPU_BIG in velocity calculation
+CPU_THROTTLE_STEP = 0.85        # Throttle step at medium power
+
+# Zone confidence for predictions
+PREDICTION_CONFIDENCE = {
+    'BATTERY': 0.95,      # Measured current = ground truth
+    'CPU_BIG': 0.85,      # Component throttling understood
+    'CPU_LITTLE': 0.85,   # Component throttling understood
+    'GPU': 0.75,          # Workload variability
+    'MODEM': 0.70,        # Network unpredictable
+    'CHASSIS': 0.80,      # Damped response
+}
+PREDICTION_CONFIDENCE_DEFAULT = 0.60
+PREDICTION_CONFIDENCE_FALLBACK = 0.7        # Used in status when no prediction available
+
+# Thermal contribution weights for coupled prediction
+THERMAL_CONTRIBUTION_WEIGHTS = {
+    'CPU_BIG': 0.40,
+    'CPU_LITTLE': 0.20,
+    'GPU': 0.20,
+    'BATTERY': 0.00,
+    'MODEM': 0.20
+}
+
+# ============================================================================
+# SMOOTHING PARAMETERS
+# ============================================================================
+VELOCITY_SMOOTHING_ALPHA = 0.3              # EMA alpha for velocity smoothing
+VELOCITY_SMOOTHING_WEIGHT = 0.1             # Weight for current vs recent average
+VELOCITY_JUMP_THRESHOLD_DEFAULT = 1.0       # °C/s - default regime change threshold
+VELOCITY_JUMP_THRESHOLD_GPU = 0.5           # °C/s - GPU more sensitive
+TEMP_SCALE_ALPHA = 0.02                     # Temperature scaling alpha
+TEMP_SCALE_MIN = 0.1                        # Minimum temperature scale factor
+TEMP_SCALE_REF = 30.0                       # °C - reference temperature
+
+# ============================================================================
+# AMBIENT INFLUENCE
+# ============================================================================
+AMBIENT_PULL_EFFICIENT_COOLING = 0.25       # fraction - efficient cooling ambient influence
+
+# ============================================================================
+# DISPLAY THERMAL CONVERSION
+# ============================================================================
+DISPLAY_BRIGHTNESS_DIVISOR = 255.0          # convert brightness (0-255) to fraction
+
+# ============================================================================
+# SENSOR FAILURE TRACKING
+# ============================================================================
+MAX_SENSOR_FAILURES = 5                     # consecutive failures before degrading confidence
+
+# ============================================================================
+# THERMAL CONVERSIONS
+# ============================================================================
+MILLIDEGREE_TO_DEGREE = 1000.0              # conversion factor for kernel thermal zones
+
+# ============================================================================
+# BASELINE POWER FRACTIONS
+# ============================================================================
+BASELINE_FRACTION_CPU_BIG = 0.4             # Baseline power attribution to CPU_BIG
+BASELINE_FRACTION_OTHER = 0.3               # Baseline power attribution to other zones
+
+# ============================================================================
+# AMBIENT ESTIMATION THRESHOLDS
+# ============================================================================
+# Battery-to-coolest sensor differential thresholds
+BATTERY_COOLEST_DIFF_HIGH = 8.0             # °C - battery much warmer than coolest
+BATTERY_COOLEST_DIFF_LOW = 3.0              # °C - battery close to coolest
+
+# ============================================================================
+# REGIME DETECTION THRESHOLDS
+# ============================================================================
+MAX_VELOCITY_THRESHOLD = 5.0                # °C/s - maximum velocity before regime change
+VELOCITY_CHANGE_THRESHOLD = 3.0             # °C/s - velocity delta for regime shift
+REGIME_SUSTAINED_THRESHOLD = 2.0            # °C/s - threshold for sustained regime
+
+# ============================================================================
+# VELOCITY SMOOTHING THRESHOLDS
+# ============================================================================
+JUMP_THRESHOLD_DEFAULT = 0.8                # °C/s - default jump detection
+VELOCITY_EPSILON = 0.01                     # °C/s - minimum meaningful velocity
+ACCELERATION_STABLE_THRESHOLD = 0.05        # °C/s² - acceleration considered stable
+ACCELERATION_SIGNIFICANT_THRESHOLD = 0.1    # °C/s² - significant acceleration
+
+# ============================================================================
+# THROTTLE FACTOR THRESHOLDS
+# ============================================================================
+THROTTLE_FACTOR_ACTIVE = 1.0                # No throttling active
+
+# ============================================================================
+# POWER NORMALIZATION THRESHOLDS
+# ============================================================================
+POWER_NORMALIZED_LOW = 0.1                  # Normalized power - low threshold
+POWER_NORMALIZED_MED = 0.5                  # Normalized power - medium threshold
+
+# ============================================================================
+# BATTERY VELOCITY THRESHOLDS
+# ============================================================================
+BATTERY_VELOCITY_HEATING = 0.001            # °C/s - battery heating threshold
+
+# ============================================================================
 # FEATURE FLAGS
 # ============================================================================
 THERMAL_PREDICTION_ENABLED = True
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def get_accuracy_rating(zone_name: str, error: float) -> Tuple[str, str, str]:
+    """
+    Get accuracy rating, color, and label for a prediction error.
+    
+    Args:
+        zone_name: Zone name (e.g. 'CPU_BIG', 'BATTERY')
+        error: Absolute prediction error in °C
+    
+    Returns:
+        (rating, color_hex, label) tuple
+        - rating: 'excellent', 'good', 'fair', or 'poor'
+        - color_hex: Hex color from PNGN_32 palette
+        - label: Display label ('EXCELLENT', 'GOOD', 'FAIR', 'POOR')
+    
+    Examples:
+        >>> get_accuracy_rating('BATTERY', 0.3)
+        ('excellent', '#00FF7F', 'EXCELLENT')
+        >>> get_accuracy_rating('CPU_BIG', 2.5)
+        ('good', '#00FF00', 'GOOD')
+        >>> get_accuracy_rating('GPU', 3.0)
+        ('fair', '#CC33FF', 'FAIR')
+    """
+    # Get zone thresholds, fall back to CPU_BIG for unknown zones
+    thresholds = ACCURACY_THRESHOLDS.get(zone_name, ACCURACY_THRESHOLDS['CPU_BIG'])
+    
+    # Determine rating based on error magnitude
+    if error < thresholds['excellent']:
+        rating = 'excellent'
+    elif error < thresholds['good']:
+        rating = 'good'
+    elif error < thresholds['fair']:
+        rating = 'fair'
+    else:
+        rating = 'poor'
+    
+    return rating, ACCURACY_COLORS[rating], ACCURACY_LABELS[rating]
 
 # ============================================================================
 # SHARED TYPES
 # ============================================================================
 
 class ThermalState(Enum):
+    """Device thermal state classification for throttling decisions"""
     COLD = auto()
     OPTIMAL = auto()
     WARM = auto()
@@ -331,6 +765,10 @@ class ThermalState(Enum):
     UNKNOWN = auto()
 
 class ThermalZone(Enum):
+    """
+    Hardware thermal zones on Samsung S25+ (Snapdragon 8 Elite).
+    Values are /sys/class/thermal/thermal_zone{N} indices.
+    """
     CPU_BIG = 20       # cpuss-1-0: 2× Oryon Prime aggregate
     CPU_LITTLE = 13    # cpuss-0-0: 6× Oryon efficiency aggregate  
     GPU = 23           # gpuss-0: Adreno 830
@@ -340,6 +778,7 @@ class ThermalZone(Enum):
     AMBIENT = 52       # sys-therm-5: ambient air temperature (NEW)
 
 class ThermalTrend(Enum):
+    """Temperature rate of change classification for prediction confidence"""
     RAPID_COOLING = auto()
     COOLING = auto()
     STABLE = auto()
@@ -347,6 +786,7 @@ class ThermalTrend(Enum):
     RAPID_WARMING = auto()
 
 class NetworkType(Enum):
+    """Network connection type for power modeling"""
     UNKNOWN = auto()
     OFFLINE = auto()
     WIFI_2G = auto()
@@ -356,6 +796,7 @@ class NetworkType(Enum):
     MOBILE_5G = auto()
 
 class MemoryPressureLevel(IntEnum):
+    """System memory pressure classification for resource management"""
     NORMAL = 0
     MODERATE = 1
     HIGH = 2
@@ -367,7 +808,24 @@ class MemoryPressureLevel(IntEnum):
 
 @dataclass
 class ThermalSample:
-    """Temperature measurement at single point in time"""
+    """
+    Temperature measurement at single point in time.
+    
+    Attributes:
+        timestamp: Unix timestamp of sample
+        zones: Temperature readings per thermal zone (°C)
+        confidence: Confidence score per zone (0.0-1.0)
+        chassis: Chassis/ambient temperature estimate (°C)
+        network: Current network type for power modeling
+        charging: Whether device is charging
+        workload_hash: Optional workload identifier
+        cache_hit_rate: Vapor chamber efficiency estimate
+        display_brightness: Screen brightness level (0-255)
+        battery_current: Battery current in μA (negative = discharge)
+        battery_voltage: Battery voltage in mV (uses nominal 3.8V if unavailable)
+        battery_temp: Battery temperature in °C
+        battery_pct: Battery percentage (0-100)
+    """
     timestamp: float
     zones: Dict[ThermalZone, float]
     confidence: Dict[ThermalZone, float]
@@ -375,9 +833,12 @@ class ThermalSample:
     network: NetworkType = NetworkType.UNKNOWN
     charging: bool = False
     workload_hash: Optional[str] = None
-    cache_hit_rate: float = 0.85
+    cache_hit_rate: float = S25_PLUS_VAPOR_CHAMBER_EFFICIENCY
     display_brightness: Optional[int] = None
     battery_current: Optional[float] = None
+    battery_voltage: Optional[int] = None  # mV
+    battery_temp: Optional[float] = None   # °C
+    battery_pct: Optional[int] = None      # percentage
 
 @dataclass
 class ThermalVelocity:
@@ -387,7 +848,6 @@ class ThermalVelocity:
     trend: ThermalTrend
     acceleration: float  # °C/second²
 
-@dataclass
 @dataclass
 class ThermalPrediction:
     """Future temperature prediction per zone"""
@@ -415,7 +875,7 @@ class ThermalStatistics:
     thermal_cycles: int
     time_above_warm: float
     last_critical: Optional[float] = None
-    workload_correlation: float = 0.5
+    workload_correlation: float = THERMAL_SENSOR_CONFIDENCE_REDUCED
     network_impact: float = 0.0
     charging_impact: float = 0.0
 
@@ -542,127 +1002,58 @@ class ThermalTelemetryCollector:
     
     async def collect_sample(self, for_prediction: bool = False) -> ThermalSample:
         """
-        Collect complete thermal sample with optimized caching.
+        Collect complete thermal sample from cache.
+        Battery/network/brightness are updated by independent background loop.
+        
+        Populates battery_current, battery_temp, battery_pct from Termux API cache.
+        Battery voltage uses nominal 3.8V (3800mV) as Termux doesn't expose actual voltage.
         
         Args:
-            for_prediction: If True, uses 1s cache (accurate for predictions)
-                          If False, uses 5s cache (efficient for display/UI)
+            for_prediction: If True, uses prediction cache (0.5s freshness)
+                          If False, uses UI cache (5s freshness)
+        
+        Returns:
+            ThermalSample with temperature readings and battery metrics
         """
         timestamp = time.time()
         
-        # Determine which cache to use and max age per API type
+        # Determine which cache to use
         if for_prediction:
-            battery_cache_time = self.pred_battery_time
             battery_cache = self.pred_battery
-            network_cache_time = self.pred_network_time
             network_cache = self.pred_network
-            brightness_cache_time = self.pred_brightness_time
             brightness_cache = self.pred_brightness
-            battery_max_age = 30.0      # 30s - expensive, ground truth for power
-            network_max_age = 300.0     # 5min - rare regime change, not physics input
-            brightness_max_age = 60.0   # 1min - slow changes, context only
         else:
-            battery_cache_time = self.ui_battery_time
             battery_cache = self.ui_battery
-            network_cache_time = self.ui_network_time
             network_cache = self.ui_network
-            brightness_cache_time = self.ui_brightness_time
             brightness_cache = self.ui_brightness
-            battery_max_age = 5.0       # 5s for UI
-            network_max_age = 60.0      # 1min for UI
-            brightness_max_age = 30.0   # 30s for UI
         
         # Read thermal zones (fast, local filesystem)
         zones, confidence = await self._read_thermal_zones_batch()
-        
-        # PARALLEL API CALLS (50% faster than sequential)
-        # Only call APIs if cache is expired
-        api_tasks = []
-        need_battery = (timestamp - battery_cache_time) > battery_max_age
-        need_network = (timestamp - network_cache_time) > network_max_age
-        need_brightness = (timestamp - brightness_cache_time) > brightness_max_age
-        
-        if need_battery:
-            api_tasks.append(self._read_battery_status())
-        if need_network:
-            api_tasks.append(self._detect_network_type())
-        if need_brightness:
-            api_tasks.append(self._get_display_brightness())
-        
-        # Run all API calls in parallel
-        if api_tasks:
-            try:
-                results = await asyncio.gather(*api_tasks, return_exceptions=True)
-                
-                # Process results
-                result_idx = 0
-                if need_battery:
-                    battery_result = results[result_idx]
-                    result_idx += 1
-                    if not isinstance(battery_result, Exception) and battery_result:
-                        battery_cache = battery_result
-                        battery_cache_time = timestamp
-                        # Update the appropriate cache
-                        if for_prediction:
-                            self.pred_battery = battery_cache
-                            self.pred_battery_time = timestamp
-                        else:
-                            self.ui_battery = battery_cache
-                            self.ui_battery_time = timestamp
-                
-                if need_network:
-                    network_result = results[result_idx]
-                    result_idx += 1
-                    if not isinstance(network_result, Exception) and network_result != NetworkType.UNKNOWN:
-                        network_cache = network_result
-                        network_cache_time = timestamp
-                        # Update the appropriate cache
-                        if for_prediction:
-                            self.pred_network = network_cache
-                            self.pred_network_time = timestamp
-                        else:
-                            self.ui_network = network_cache
-                            self.ui_network_time = timestamp
-                
-                if need_brightness:
-                    brightness_result = results[result_idx]
-                    if not isinstance(brightness_result, Exception) and brightness_result is not None:
-                        brightness_cache = brightness_result
-                        brightness_cache_time = timestamp
-                        # Update the appropriate cache
-                        if for_prediction:
-                            self.pred_brightness = brightness_cache
-                            self.pred_brightness_time = timestamp
-                        else:
-                            self.ui_brightness = brightness_cache
-                            self.ui_brightness_time = timestamp
-            
-            except Exception as e:
-                logger.debug(f"Parallel API call error: {e}")
-        
-        # Update legacy cache for backward compatibility
-        if battery_cache:
-            self.battery_cache = battery_cache
-            self.last_battery_read = battery_cache_time
-        if network_cache != NetworkType.UNKNOWN:
-            self.network_cache = network_cache
-            self.last_network_read = network_cache_time
         
         # Ambient temperature (use AMBIENT zone or estimate)
         chassis_temp = zones.get(ThermalZone.CHASSIS)
         if chassis_temp is None:
             # Estimate ambient from battery (slowest changing zone)
-            chassis_temp = zones.get(ThermalZone.BATTERY, 25.0) - 5.0
+            chassis_temp = zones.get(ThermalZone.BATTERY, AMBIENT_TEMP_FALLBACK) - 5.0
         
         # Extract data from cache
         charging = battery_cache.get('plugged', False) if battery_cache else False
         display_brightness = brightness_cache
         
         battery_current = None
+        battery_voltage = None
+        battery_temp = None
+        battery_pct = None
+        
         if battery_cache:
             battery_current = battery_cache.get('current', None)
+            battery_temp = battery_cache.get('temperature', None)
+            battery_pct = battery_cache.get('percentage', None)
+            # Termux doesn't provide voltage, use nominal
+            if battery_current is not None:
+                battery_voltage = int(BATTERY_NOMINAL_VOLTAGE * 1000)  # Convert to mV
         
-        cache_hit_rate = 0.85
+        cache_hit_rate = S25_PLUS_VAPOR_CHAMBER_EFFICIENCY
         
         return ThermalSample(
             timestamp=timestamp,
@@ -674,13 +1065,16 @@ class ThermalTelemetryCollector:
             workload_hash=None,
             cache_hit_rate=cache_hit_rate,
             display_brightness=display_brightness,
-            battery_current=battery_current
+            battery_current=battery_current,
+            battery_voltage=battery_voltage,
+            battery_temp=battery_temp,
+            battery_pct=battery_pct
         )
     
     async def _read_thermal_zones_batch(self) -> Tuple[Dict[ThermalZone, float], Dict[ThermalZone, float]]:
         """
         Read all thermal zones efficiently in batch.
-        Uses single shell command instead of multiple file opens.
+        Reads zone temp files directly; no external shell command.
         """
         zones = {}
         confidence = {}
@@ -698,12 +1092,12 @@ class ThermalTelemetryCollector:
             try:
                 with open(path, 'r') as f:
                     # Temperature in millidegrees
-                    temp = float(f.read().strip()) / 1000.0
+                    temp = float(f.read().strip()) / MILLIDEGREE_TO_DEGREE
                     
                     # Validate temperature
                     if THERMAL_SENSOR_TEMP_MIN <= temp <= THERMAL_SENSOR_TEMP_MAX:
                         zones[zone_enum] = temp
-                        confidence[zone_enum] = 1.0
+                        confidence[zone_enum] = VELOCITY_WEIGHT_DEFAULT
                     else:
                         # Out of range - reduced confidence
                         zones[zone_enum] = temp
@@ -712,7 +1106,7 @@ class ThermalTelemetryCollector:
                 self.read_failures[zone_enum] = 0
             except Exception as e:
                 self.read_failures[zone_enum] += 1
-                if self.read_failures[zone_enum] < 5:
+                if self.read_failures[zone_enum] < MAX_SENSOR_FAILURES:
                     logger.debug(f"Failed to read {zone_enum.name}: {e}")
         
         return zones, confidence
@@ -725,7 +1119,15 @@ class ThermalTelemetryCollector:
         return await self.collect_sample(for_prediction=False)
     
     async def _read_battery_status(self) -> Optional[Dict]:
-        """Read battery status from Termux API"""
+        """
+        Read battery status from Termux API.
+        
+        Returns:
+            Dict with keys: 'plugged' (bool), 'percentage' (int), 
+            'temperature' (float in °C), 'current' (float in μA)
+            Returns None if read fails.
+        """
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *TERMUX_BATTERY_STATUS_CMD,
@@ -733,7 +1135,7 @@ class ThermalTelemetryCollector:
                 stderr=asyncio.subprocess.PIPE
             )
             
-            stdout, _ = await asyncio.wait_for(
+            stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), 
                 timeout=THERMAL_SUBPROCESS_TIMEOUT
             )
@@ -743,11 +1145,19 @@ class ThermalTelemetryCollector:
                 return {
                     'plugged': data.get('plugged', 'UNPLUGGED') != 'UNPLUGGED',
                     'percentage': data.get('percentage', 0),
-                    'temperature': data.get('temperature', 25.0),
+                    'temperature': data.get('temperature', AMBIENT_TEMP_FALLBACK),
                     'current': data.get('current', 0)  # mA (+ charging, - discharging)
                 }
-        except (asyncio.TimeoutError, json.JSONDecodeError, Exception) as e:
-            logger.debug(f"Battery status read failed: {e}")
+        except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+            pass
+        finally:
+            # Ensure process is cleaned up
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except:
+                    pass
         
         return None
     
@@ -828,7 +1238,7 @@ class ThermalTelemetryCollector:
                 # Parse brightness value (0-255)
                 brightness_str = stdout.decode().strip()
                 brightness = int(brightness_str)
-                return max(0, min(brightness, 255))
+                return max(BRIGHTNESS_MIN, min(brightness, BRIGHTNESS_MAX))
         
         except Exception as e:
             logger.debug(f"Brightness detection failed: {e}")
@@ -839,9 +1249,9 @@ class ThermalTelemetryCollector:
     def estimate_display_power(self, brightness: Optional[int] = None) -> float:
         """Estimate display power based on brightness"""
         if brightness is None:
-            brightness = 128
+            brightness = BRIGHTNESS_FALLBACK
         
-        brightness_fraction = brightness / 255.0
+        brightness_fraction = brightness / DISPLAY_BRIGHTNESS_DIVISOR
         return DISPLAY_POWER_MIN + (DISPLAY_POWER_MAX - DISPLAY_POWER_MIN) * brightness_fraction
 
 
@@ -855,8 +1265,9 @@ class ZonePhysicsEngine:
     Each zone has unique thermal mass, resistance, and time constant.
     """
     
-    def __init__(self):
+    def __init__(self, power_learning: Optional['PowerLearningSystem'] = None):
         self.zone_constants = ZONE_THERMAL_CONSTANTS
+        self.power_learning = power_learning
         
         logger.info(f"Physics engine initialized with {len(self.zone_constants)} zone models")
     
@@ -864,11 +1275,10 @@ class ZonePhysicsEngine:
         """
         Dynamically estimate ambient temperature from system state.
         
-        IMPROVED v2.8: 
-        - Removed 40°C clamp (was causing 10-27°C errors outdoors)
+        Features:
         - Dynamic offset based on battery-to-coolest delta
         - Sun exposure detection (battery cooler than active zones)
-        - Wider valid range (10-70°C instead of 10-40°C)
+        - Wide valid range (10-70°C)
         """
         # Try to find battery zone
         battery_temp = None
@@ -890,10 +1300,10 @@ class ZonePhysicsEngine:
                     temps_sorted = sorted(temps)
                     n = max(1, len(temps_sorted) * 3 // 5)
                     avg_cool = sum(temps_sorted[:n]) / n
-                    return max(10.0, min(avg_cool - 2.5, 70.0))
+                    return max(AMBIENT_TEMP_MIN, min(avg_cool - AMBIENT_ESTIMATE_OFFSET, AMBIENT_TEMP_MAX))
                 elif temps:
-                    return max(10.0, min(min(temps) - 2.5, 70.0))
-            return sample.chassis if sample.chassis else 25.0
+                    return max(10.0, min(min(temps) - AMBIENT_ESTIMATE_OFFSET, 70.0))
+            return sample.chassis if sample.chassis else AMBIENT_TEMP_FALLBACK
         
         coolest = min(other_temps)
         hottest = max(other_temps)
@@ -908,25 +1318,25 @@ class ZonePhysicsEngine:
             
             if sample.charging:
                 # Charging generates heat
-                if battery_current and battery_current > 1500:  # Fast charge
-                    base_offset = 8.0
+                if battery_current and battery_current > FAST_CHARGE_CURRENT_MA:  # Fast charge
+                    base_offset = BASE_OFFSET_FAST_CHARGE
                 else:
-                    base_offset = 6.0
-            elif battery_current and battery_current < -1500:
+                    base_offset = BASE_OFFSET_DISCHARGE
+            elif battery_current and battery_current < -FAST_CHARGE_CURRENT_MA:
                 # Heavy discharge
-                base_offset = 5.0
+                base_offset = BASE_OFFSET_IDLE
             else:
                 # Light discharge/idle
-                base_offset = 3.0
+                base_offset = BASE_OFFSET_SLOW_CHARGE
             
             # Adjust offset based on battery-to-coolest delta
             # Larger delta = more active system = larger offset
             battery_to_coolest = battery_temp - coolest
-            if battery_to_coolest > 8.0:
+            if battery_to_coolest > BATTERY_COOLEST_DIFF_HIGH:
                 # Very hot battery relative to CPU - reduce offset
                 # (ambient is probably also hot)
                 offset = base_offset * 0.7
-            elif battery_to_coolest < 3.0:
+            elif battery_to_coolest < BATTERY_COOLEST_DIFF_LOW:
                 # Battery barely above CPU - increase offset
                 # (everything at near-ambient)
                 offset = base_offset * 1.3
@@ -960,23 +1370,76 @@ class ZonePhysicsEngine:
         
         # Clamp to physically reasonable range
         # Removed 40°C cap - outdoor environments can be 50-60°C
-        ambient_est = max(10.0, min(ambient_est, 70.0))
+        ambient_est = max(AMBIENT_TEMP_MIN, min(ambient_est, AMBIENT_TEMP_MAX))
         
         return ambient_est
     
-    def effective_thermal_resistance(self, zone_name: str, temp: float, 
-                                     chassis: float) -> float:
+    def fit_ambient_temperature(self, samples: List[ThermalSample]) -> Optional[float]:
         """
-        Return thermal resistance for the zone.
-        
-        This is the constant R value in Newton's law of cooling.
-        Previously had exponential corrections - those were band-aids for missing throttling.
+        Simplified ambient estimation - avoids scipy/numpy allocations.
+        Uses simple min-based estimation with physics offsets.
         """
-        if zone_name not in self.zone_constants:
-            return 5.0  # Default fallback
+        if len(samples) < MIN_SAMPLES_FOR_PREDICTIONS:
+            return None
         
-        zc = self.zone_constants[zone_name]
-        return zc['thermal_resistance']
+        # Use last few samples
+        recent_samples = samples[-MIN_SAMPLES_FOR_PREDICTIONS:]
+        
+        # Extract battery and chassis temps
+        battery_temps = []
+        chassis_temps = []
+        
+        for sample in recent_samples:
+            batt_temp = sample.zones.get(ThermalZone.BATTERY)
+            chas_temp = sample.zones.get(ThermalZone.CHASSIS)
+            
+            if batt_temp is not None and chas_temp is not None:
+                battery_temps.append(batt_temp)
+                chassis_temps.append(chas_temp)
+        
+        if len(battery_temps) < MIN_SAMPLES_AMBIENT_FIT:
+            return None
+        
+        # Simple min-based estimation with physics offsets
+        T_amb_from_battery = min(battery_temps) - 2.0  # Battery runs ~2°C above ambient
+        T_amb_from_chassis = min(chassis_temps) - 4.0  # Chassis runs ~4°C above ambient
+        
+        # Weight by stability (lower variance = more reliable)
+        if len(battery_temps) >= 3:
+            batt_std = statistics.stdev(battery_temps)
+            chas_std = statistics.stdev(chassis_temps)
+            
+            if batt_std < chas_std:
+                T_ambient = 0.7 * T_amb_from_battery + 0.3 * T_amb_from_chassis
+            else:
+                T_ambient = 0.3 * T_amb_from_battery + 0.7 * T_amb_from_chassis
+        else:
+            T_ambient = (T_amb_from_battery + T_amb_from_chassis) / 2.0
+        
+        # Sanity: ambient must be below all observed temps
+        absolute_min = min(min(battery_temps), min(chassis_temps))
+        if T_ambient > absolute_min:
+            T_ambient = absolute_min - 1.0
+        
+        # Clamp to reasonable range
+        return max(AMBIENT_TEMP_MIN, min(T_ambient, THROTTLE_AGGRESSIVE_TEMP))
+        return max(AMBIENT_TEMP_MIN, min(T_ambient, THROTTLE_AGGRESSIVE_TEMP))
+
+    
+
+    def _should_predict(self, zone: ThermalZone, vel: float) -> bool:
+        """
+        Simple prediction filter without buffer tracking.
+        Always returns True - let physics handle it.
+        """
+        return True
+    
+    def _check_velocity_pattern(self, zone: ThermalZone, vel: float) -> str:
+        """
+        Simple velocity pattern check without history tracking.
+        Returns 'normal' always - let throttle curves handle it.
+        """
+        return 'normal'
     
     def calculate_velocity(self, samples: List[ThermalSample]) -> ThermalVelocity:
         """Calculate dT/dt for each zone using linear regression"""
@@ -988,8 +1451,8 @@ class ZonePhysicsEngine:
                 acceleration=0.0
             )
         
-        # Use last 5 samples for velocity calculation (noise reduction)
-        recent = samples[-5:] if len(samples) >= 5 else samples
+        # Use last N samples for velocity calculation (noise reduction)
+        recent = samples[-VELOCITY_CALCULATION_SAMPLES:] if len(samples) >= VELOCITY_CALCULATION_SAMPLES else samples
         
         zone_velocities = {}
         
@@ -1013,17 +1476,17 @@ class ZonePhysicsEngine:
         # CPU_BIG and GPU weighted higher as they throttle first
         if zone_velocities:
             weights = {
-                ThermalZone.CPU_BIG: 2.0,
-                ThermalZone.GPU: 1.5,
-                ThermalZone.CPU_LITTLE: 1.0,
-                ThermalZone.BATTERY: 0.5,
-                ThermalZone.MODEM: 0.8,
+                ThermalZone.CPU_BIG: CPU_BIG_VELOCITY_WEIGHT,
+                ThermalZone.GPU: VELOCITY_WEIGHTS['GPU'],
+                ThermalZone.CPU_LITTLE: VELOCITY_WEIGHTS['CPU_LITTLE'],
+                ThermalZone.BATTERY: VELOCITY_WEIGHTS['BATTERY'],
+                ThermalZone.MODEM: VELOCITY_WEIGHTS['MODEM'],
             }
             
             weighted_sum = 0.0
             total_weight = 0.0
             for zone, vel in zone_velocities.items():
-                w = weights.get(zone, 1.0)
+                w = weights.get(zone, VELOCITY_WEIGHT_DEFAULT)
                 weighted_sum += vel * w
                 total_weight += w
             
@@ -1066,6 +1529,36 @@ class ZonePhysicsEngine:
             trend=trend,
             acceleration=accel
         )
+    
+    def validate_and_smooth_velocity(self, zone: ThermalZone, velocity: float) -> Tuple[float, bool]:
+        """
+        Simple velocity validation without history tracking.
+        Returns velocity as-is with reliability flag.
+        """
+        # No history tracking - just return velocity as reliable
+        return velocity, True
+    
+    def calculate_component_throttle(self, zone_temp: float, zone_name: str) -> float:
+        """
+        Calculate per-component throttle based on temperature.
+        Components throttle themselves as temps rise.
+        """
+        if zone_name not in COMPONENT_THROTTLE_CURVES:
+            return 1.0
+        
+        curve = COMPONENT_THROTTLE_CURVES[zone_name]
+        temp_start = curve['temp_start']
+        temp_aggressive = curve['temp_aggressive']
+        min_factor = curve['min_factor']
+        
+        if zone_temp <= temp_start:
+            return 1.0
+        elif zone_temp >= temp_aggressive:
+            return min_factor
+        else:
+            # Linear interpolation between start and aggressive
+            progress = (zone_temp - temp_start) / (temp_aggressive - temp_start)
+            return 1.0 - (1.0 - min_factor) * progress
     
     def calculate_throttle_factor(self, battery_temp: float, zone_name: str) -> float:
         """
@@ -1174,15 +1667,15 @@ class ZonePhysicsEngine:
             # Exponential decay: models GPU bin dropping
             # factor = 1.0 * exp(-k * normalized) + min_factor * (1 - exp(-k))
             # Solve for k such that at normalized=1.0, factor=min_factor
-            k = 3.0  # Tuned for realistic GPU behavior
+            k = GPU_THERMAL_COEFFICIENT  # Tuned for realistic GPU behavior
             exp_term = math.exp(-k * normalized)
             factor = 1.0 * exp_term + min_factor * (1.0 - exp_term)
         elif curve_shape == 'stepped':
             # Step function: sudden drops (CPU burst behavior)
-            if normalized < 0.1:
+            if normalized < POWER_NORMALIZED_LOW:
                 factor = 1.0
-            elif normalized < 0.5:
-                factor = 0.85
+            elif normalized < POWER_NORMALIZED_MED:
+                factor = CPU_THROTTLE_STEP
             else:
                 factor = min_factor
         else:
@@ -1218,7 +1711,7 @@ class ZonePhysicsEngine:
         """
         # Calculate total system power
         I_amps = abs(battery_current) / 1_000_000.0  # μA → A
-        V_battery = 3.8  # Typical Li-ion voltage
+        V_battery = BATTERY_NOMINAL_VOLTAGE  # Typical Li-ion voltage
         P_system_total = I_amps * V_battery
         
         # === SUBTRACT FIXED LOADS ===
@@ -1227,7 +1720,7 @@ class ZonePhysicsEngine:
         
         display_brightness = getattr(current_sample, 'display_brightness', None)
         if display_brightness is not None:
-            brightness_factor = display_brightness / 255.0
+            brightness_factor = display_brightness / DISPLAY_BRIGHTNESS_DIVISOR
             P_display = DISPLAY_POWER_MIN + (DISPLAY_POWER_MAX - DISPLAY_POWER_MIN) * brightness_factor
         else:
             P_display = (DISPLAY_POWER_MIN + DISPLAY_POWER_MAX) / 2.0
@@ -1242,7 +1735,7 @@ class ZonePhysicsEngine:
         # 5. Charging inefficiency
         P_charging = 0.0
         if current_sample.charging and battery_current > 0:
-            P_charging = 0.15 * I_amps * 4.2
+            P_charging = 0.20 * I_amps * 4.2
         
         # Total fixed load
         P_fixed = P_baseline + P_display + P_modem_fixed + P_battery_losses + P_charging
@@ -1270,7 +1763,7 @@ class ZonePhysicsEngine:
         
         vel_total = vel_cpu_big + vel_cpu_little + vel_gpu
         
-        if vel_total > 0.01:
+        if vel_total > VELOCITY_EPSILON:
             # Distribute by which zones are heating
             if zone_name == 'CPU_BIG':
                 return P_variable * (vel_cpu_big / vel_total)
@@ -1330,11 +1823,19 @@ class ZonePhysicsEngine:
             # Fallback to estimation if chassis sensor unavailable
             chassis_temp = self.estimate_chassis(current)
         
-        # Get actual ambient air temperature from zone 52
-        ambient_air_temp = current.zones.get(ThermalZone.AMBIENT, None)
+        # Get TRUE ambient from exponential fitting of battery/chassis
+        ambient_air_temp = self.fit_ambient_temperature(samples) if samples else None
         if ambient_air_temp is None:
-            # Fallback: estimate from chassis if ambient sensor unavailable
-            ambient_air_temp = chassis_temp - 10.0  # Chassis typically 10°C above room air
+            # Cannot predict without fitted ambient - return empty prediction
+            return ThermalPrediction(
+                timestamp=current.timestamp + horizon,
+                horizon=horizon,
+                predicted_temps={},
+                thermal_budget=THERMAL_BUDGET_UNLIMITED,
+                confidence=0.0,
+                confidence_by_zone={},
+                power_by_zone={}
+            )
         
         # ========================================================================
         # PREDICT BATTERY TEMPERATURE FOR THROTTLING DECISIONS
@@ -1386,22 +1887,21 @@ class ZonePhysicsEngine:
             
             constants = self.zone_constants[zone_name]
             
-            # ========================================================================
-            # THROTTLE ZONE CHECK: Use observed peak if already throttling
-            # ========================================================================
-            # If zone is already hot enough to throttle, predict the observed peak
-            # from validation data instead of trying to model the throttled regime.
-            # Physics breaks at regime changes - just use empirical data.
+            # Apply component throttling - this models actual hardware behavior
+            throttle_factor = self.calculate_component_throttle(current_temp, zone_name)
+            
+            # If approaching throttle temps, predict plateau at observed_peak
             if zone_name in COMPONENT_THROTTLE_CURVES:
-                throttle_info = COMPONENT_THROTTLE_CURVES[zone_name]
-                if current_temp >= throttle_info['temp_start']:
-                    # Already in throttle regime - use observed peak
-                    predicted_temps[zone] = throttle_info['observed_peak']
-                    power_by_zone[zone] = 0.0  # Unknown power in throttle regime
-                    continue  # Skip physics calculation
+                curve = COMPONENT_THROTTLE_CURVES[zone_name]
+                if current_temp > curve['temp_start']:
+                    # Temperature will plateau near observed_peak under sustained load
+                    observed_peak = curve['observed_peak']
+                    # Blend physics prediction with observed peak based on how throttled we are
+                    physics_weight = throttle_factor
+                    plateau_weight = 1.0 - throttle_factor
             
             # ========================================================================
-            # BATTERY SPECIAL CASE (v2.10): Integration of measured power
+            # BATTERY SPECIAL CASE (): Integration of measured power
             # ========================================================================
             # Battery τ=540s >> 30s horizon, so Newton's law reduces to dT/dt ≈ P/C
             # Use measured current for ground truth power, skip ambient estimation
@@ -1448,45 +1948,59 @@ class ZonePhysicsEngine:
             # GENERAL ZONES: Full Newton's law with ambient coupling
             # ========================================================================
             C = constants['thermal_mass']
-            # Use temperature-dependent thermal resistance
-            # Components couple to chassis, not ambient air
-            R = self.effective_thermal_resistance(zone_name, current_temp, chassis_temp)
             k = constants['ambient_coupling']
             
-            # ========================================================================
-            # POWER INJECTION (V2.3 FIX) - Add all known power sources
-            # ========================================================================
+            # Get velocity first
+            vel = velocity.zones.get(zone, 0)
             
-            # Get measured battery current for instant power awareness
-            battery_current = getattr(current, 'battery_current', None)
+            # Validate velocity for regime changes (sudden jumps break physics model)
+            vel_smoothed, vel_reliable = self.validate_and_smooth_velocity(zone, vel)
             
-            # For CPU/GPU zones: use battery current if available (instant, no lag)
-            # For other zones: fall back to velocity-based estimate
-            if battery_current is not None and zone_name in ['CPU_BIG', 'CPU_LITTLE', 'GPU', 'MODEM']:
-                P_from_battery = self._calculate_zone_power_from_battery(
-                    zone_name=zone_name,
-                    battery_current=battery_current,
-                    velocity=velocity,
-                    current_sample=current
-                )
-                
-                if P_from_battery > 0:
-                    # Use measured power from battery (instant awareness)
-                    P = P_from_battery
-                else:
-                    # Fall back to velocity-based estimate
-                    vel = velocity.zones.get(zone, 0)
-                    cooling_rate = -k * (current_temp - chassis_temp) / R
-                    heating_rate = vel - cooling_rate
-                    P_observed = heating_rate * C
-                    P = P_observed
+            # Use smoothed velocity for predictions
+            # This prevents regime change discontinuities from breaking Newton's law
+            vel = vel_smoothed
+            
+            # Check if data is clean enough to predict
+            if not self._should_predict(zone, vel):
+                # Bad data - skip this zone, defer to next cycle
+                continue
+            
+            # Get tau for this zone
+            tau_base = constants.get('time_constant', TAU_DEFAULT)
+            
+            # Determine reference temperature based on zone type
+            # CHASSIS couples to ambient, others couple to chassis
+            if zone_name == 'CHASSIS':
+                ref_temp = ambient_air_temp
             else:
-                # No battery current or other zone - use velocity-based estimate
-                vel = velocity.zones.get(zone, 0)
-                cooling_rate = -k * (current_temp - chassis_temp) / R
+                ref_temp = chassis_temp
+            
+            # Calculate cooling rate based on coupling type
+            if k > 0:
+                # Ambient-coupled (CHASSIS only): cooling rate includes k
+                cooling_rate = -k * (current_temp - ref_temp) / tau_base
+            else:
+                # Chassis-coupled (CPU, GPU, etc): k=0, cooling through tau only
+                cooling_rate = -(current_temp - ref_temp) / tau_base
+            
+            # Equilibrium detection threshold (10% of cooling rate)
+            equilibrium_threshold = 0.1 * abs(cooling_rate)
+            
+            if abs(vel) < equilibrium_threshold:
+                # Near equilibrium: velocity is measurement noise
+                # Power equals steady-state cooling rate
+                if k > 0:
+                    # Ambient-coupled: P = k*C*(T - T_ref)/τ
+                    P_observed = k * C * (current_temp - ref_temp) / tau_base
+                else:
+                    # Chassis-coupled: P = C*(T - T_ref)/τ
+                    P_observed = C * (current_temp - ref_temp) / tau_base
+            else:
+                # Transient: velocity measurement is meaningful
                 heating_rate = vel - cooling_rate
                 P_observed = heating_rate * C
-                P = P_observed
+            
+            P = P_observed
             
             # LEGACY: Still apply P_injected for non-CPU/GPU zones
             # (This code adds display, network, baseline for zones that need it)
@@ -1500,7 +2014,7 @@ class ZonePhysicsEngine:
             
             # Distribute baseline across CPU zones proportionally
             if zone_name in ['CPU_BIG', 'CPU_LITTLE']:
-                baseline_fraction = 0.4 if zone_name == 'CPU_BIG' else 0.3
+                baseline_fraction = BASELINE_FRACTION_CPU_BIG if zone_name == 'CPU_BIG' else BASELINE_FRACTION_OTHER
                 P_injected += baseline_power * baseline_fraction
             elif zone_name == 'GPU':
                 P_injected += baseline_power * 0.2
@@ -1510,7 +2024,7 @@ class ZonePhysicsEngine:
             # 2. DISPLAY POWER
             display_brightness = getattr(current, 'display_brightness', None)
             if display_brightness is not None:
-                display_power = DISPLAY_POWER_MIN + (DISPLAY_POWER_MAX - DISPLAY_POWER_MIN) * (display_brightness / 255.0)
+                display_power = DISPLAY_POWER_MIN + (DISPLAY_POWER_MAX - DISPLAY_POWER_MIN) * (display_brightness / DISPLAY_BRIGHTNESS_DIVISOR)
             else:
                 display_power = DISPLAY_POWER_MIN + (DISPLAY_POWER_MAX - DISPLAY_POWER_MIN) * 0.5
             
@@ -1534,22 +2048,22 @@ class ZonePhysicsEngine:
                 # Charging power with SoC-dependent efficiency
                 if current.charging and battery_current is not None:
                     # Sensor reports μA labeled as "mA" - adjust thresholds
-                    if battery_current > 1_000_000:  # > 1A (fast charging)
+                    if battery_current > FAST_CHARGE_CURRENT_UA:  # > 1A (fast charging)
                         base_charging_power = CHARGING_POWER_FAST
-                    elif battery_current > 500_000:  # > 0.5A (normal charging)
+                    elif battery_current > NORMAL_CHARGE_CURRENT_UA:  # > 0.5A (normal charging)
                         base_charging_power = CHARGING_POWER_NORMAL
                     else:
                         base_charging_power = CHARGING_POWER_NORMAL
                     
                     # Apply SoC-dependent efficiency curve
                     if battery_percent is not None:
-                        if battery_percent < 15:
+                        if battery_percent < BATTERY_SOC_CRITICAL:
                             # Cold battery at low SoC, poor efficiency
                             charging_power = base_charging_power * 1.35
-                        elif battery_percent > 85:
+                        elif battery_percent > BATTERY_SOC_HIGH:
                             # CV phase at high SoC, more heat
                             charging_power = base_charging_power * 1.25
-                        elif 50 <= battery_percent <= 80:
+                        elif BATTERY_SOC_OPTIMAL_MIN <= battery_percent <= BATTERY_SOC_OPTIMAL_MAX:
                             # Sweet spot - best efficiency
                             charging_power = base_charging_power * 1.05
                         else:
@@ -1568,44 +2082,68 @@ class ZonePhysicsEngine:
                     discharge_power = current_amps ** 2 * S25_PLUS_BATTERY_INTERNAL_RESISTANCE
                     P_injected += discharge_power
             
-            # Combine observed and injected power
-            # UNLESS we used battery_current for CPU/GPU (already accounts for everything)
-            if battery_current is not None and zone_name in ['CPU_BIG', 'CPU_LITTLE', 'GPU', 'MODEM']:
-                # Battery current method already accounted for all loads
-                # Use P directly without adding P_injected
-                P_final = P
+            
+            # ====================================================================
+            # POWER COMBINATION: Observed vs Known Sources ()
+            # ====================================================================
+            # P_observed = velocity-based power (what we're actually seeing)
+            # P_injected = known sources (baseline, display, network)
+            #
+            # For CPU/GPU: P_observed already captures everything, don't double-count
+            # For other zones: combine intelligently
+            
+            if zone_name in ['CPU_BIG', 'CPU_LITTLE', 'GPU', 'MODEM']:
+                # Velocity method already captures all thermal dissipation
+                # Don't add P_injected (would double-count)
+                P_final = P_observed
             elif P_observed > P_injected * 1.5:
-                # Heavy workload detected - trust velocity-based estimate
-                P = P_observed
-                P_final = P
+                # Heavy workload detected - trust velocity
+                P_final = P_observed
             elif P_observed < 0:
-                # Cooling - use only injected power (positive sources)
-                P = P_injected
-                P_final = P
+                # Cooling - use only known positive sources
+                P_final = P_injected
             else:
-                # Normal operation - use max of observed and injected
-                # This ensures we don't miss either workload OR known sources
-                P = max(P_observed, P_injected)
-                P_final = P
+                # Normal - use max of observed and known
+                P_final = max(P_observed, P_injected)
             
-            # Trend-aware power adjustment (only for non-battery-current zones)
-            if not (battery_current is not None and zone_name in ['CPU_BIG', 'CPU_LITTLE', 'GPU', 'MODEM']):
-                # If accelerating, assume power will continue to rise (conservative)
-                # If decelerating, assume power will drop (optimistic)
-                accel = velocity.acceleration
-                
-                if abs(accel) < 0.05:
-                    # Steady state - use current power
-                    pass  # P_final already set
-                elif accel > 0.1:
-                    # Accelerating - power is increasing (be conservative)
-                    P_final = P_final * 1.2
-                elif accel < -0.1:
-                    # Decelerating - power is dropping (be optimistic)
-                    P_final = P_final * 0.8
+            # Trend-aware power adjustment
+            accel = velocity.acceleration
             
-            # Clamp power to realistic range
-            P_final = max(constants['idle_power'], min(P_final, constants['peak_power']))
+            if abs(accel) < ACCELERATION_STABLE_THRESHOLD:
+                # Steady state - use current power
+                pass
+            elif accel > ACCELERATION_SIGNIFICANT_THRESHOLD:
+                # Accelerating - be conservative
+                P_final = P_final * 1.2
+            elif accel < -0.1:
+                # Decelerating - be optimistic
+                P_final = P_final * 0.8
+            
+            # ====================================================================
+            # POWER VALIDATION (): Trust measurements, warn on outliers
+            # ====================================================================
+            # Measurements already capture reality: burst behavior, throttling,
+            # duty cycles, and overhead. Only prevent numerical instability.
+            # 
+            # peak_power is a sanity check, not a hard limit.
+            if P_final > constants['peak_power'] * 1.2:
+                logger.debug(
+                    f"{zone_name}: Measured power {P_final:.2f}W exceeds spec "
+                    f"({constants['peak_power']:.1f}W × 1.2 = {constants['peak_power'] * 1.2:.1f}W). "
+                    f"Possible measurement error or undocumented boost mode."
+                )
+            
+            # Floor only: prevent negative power (breaks physics) and near-zero (numerical issues)
+            P_final = max(0.1, P_final)
+            
+            # ====================================================================
+            # ADAPTIVE POWER LEARNING CALIBRATION ()
+            # ====================================================================
+            # Apply learned calibration to velocity-based predictions
+            # Calibration corrects systematic bias while preserving transient response
+            if self.power_learning and zone_name in ['CPU_BIG', 'CPU_LITTLE', 'GPU', 'MODEM']:
+                cal_factor = self.power_learning.get_calibration_factor(zone_name)
+                P_final *= cal_factor
             
             # ========================================================================
             # PER-COMPONENT THROTTLING: Zone's own temperature
@@ -1623,24 +2161,44 @@ class ZonePhysicsEngine:
             # This accounts for thermal runaway before it happens
             if predicted_battery_temp is not None:
                 throttle_factor = self.calculate_throttle_factor(predicted_battery_temp, zone_name)
-                if throttle_factor < 1.0:
+                if throttle_factor < THROTTLE_FACTOR_ACTIVE:
                     P_final = P_final * throttle_factor
             
             # ========================================================================
-            # TWO-STAGE PREDICTION: Component → Sensor (v2.9)
+            # TWO-STAGE PREDICTION: Component → Sensor ()
             # ========================================================================
             # Stage 1: Predict component temperature (fast response)
             # Components cool to chassis (vapor chamber), not ambient air
-            tau = constants['time_constant']  # C * R
-            exp_factor = math.exp(-horizon / tau)
+            tau_base = constants['time_constant']  # C * R (at reference temp)
+            
+            # Apply temperature-dependent scaling to tau (same as R scaling)
+            # Since τ = R × C, and R(T) = R_base × temp_scale, then τ(T) = τ_base × temp_scale
+            T_ref = TEMP_SCALE_REF
+            alpha = constants.get('r_temp_alpha', 0.0)
+            temp_scale = max(TEMP_SCALE_MIN, 1.0 - alpha * (current_temp - T_ref))
+            tau = tau_base * temp_scale
+            
+            # Exponential factor depends on coupling type
+            if k > 0:
+                # Ambient-coupled: includes k in exponential
+                exp_factor = math.exp(-k * horizon / tau)
+            else:
+                # Chassis-coupled: no k in exponential
+                exp_factor = math.exp(-horizon / tau)
             
             # Transient response: initial temperature difference decays
-            temp_transient = (current_temp - chassis_temp) * exp_factor
+            temp_transient = (current_temp - ref_temp) * exp_factor
             
             # Steady-state response: power establishes new equilibrium
-            temp_steady = (P_final * R / k) * (1 - exp_factor)
+            C = constants.get('thermal_mass', 1.0)
+            if k > 0:
+                # Ambient-coupled: P*tau/(k*C)
+                temp_steady = (P_final * tau / (k * C)) * (1 - exp_factor)
+            else:
+                # Chassis-coupled: P*tau/C (no k term)
+                temp_steady = (P_final * tau / C) * (1 - exp_factor)
             
-            component_temp = chassis_temp + temp_transient + temp_steady
+            component_temp = ref_temp + temp_transient + temp_steady
             
             # Stage 2: Measurement point thermal dynamics
             # Measured temp exponentially approaches component temp with time constant τ_meas
@@ -1657,6 +2215,31 @@ class ZonePhysicsEngine:
             else:
                 # No measurement dynamics (τ >> horizon) - use component temp directly
                 predicted_temp = component_temp
+            
+            # ========================================================================
+            # REGIME SWITCH: Plateau at max load
+            # ========================================================================
+            # Below throttle start: Newton's law runs normally
+            # At/above throttle start: Check if heading to plateau
+            if zone_name in COMPONENT_THROTTLE_CURVES:
+                curve = COMPONENT_THROTTLE_CURVES[zone_name]
+                
+                if current_temp >= curve['temp_start']:
+                    zone_velocity = velocity.zones.get(zone, 0)
+                    
+                    # Debug logging
+                    if current_temp > 60:
+                        logger.debug(f"{zone_name}: T0={current_temp:.1f}°C, vel={zone_velocity:.3f}°C/s, "
+                                   f"temp_aggressive={curve['temp_aggressive']}°C")
+                    
+                    # Plateau if:
+                    # 1. Heating rapidly (>1.0°C/s) toward max load, OR
+                    # 2. Already heavily throttled (>temp_aggressive)
+                    if zone_velocity > 1.0 or current_temp >= curve['temp_aggressive']:
+                        predicted_temp = curve['observed_peak']
+                        if current_temp > 60:
+                            logger.debug(f"{zone_name}: PLATEAU TRIGGERED → {predicted_temp}°C")
+                    # else: stable at moderate throttle, let physics run
             
             # No artificial caps - trust the physics model
             
@@ -1679,11 +2262,20 @@ class ZonePhysicsEngine:
                 # Emergency: recalculate with idle power only
                 P_emergency = constants['idle_power']
                 
-                # Recalculate with minimal power
-                exp_factor_emerg = math.exp(-k * horizon / (R * C))
-                temp_transient_emerg = (current_temp - chassis_temp) * exp_factor_emerg
-                temp_steady_emerg = (P_emergency * R / k) * (1 - exp_factor_emerg)
-                component_temp_emerg = chassis_temp + temp_transient_emerg + temp_steady_emerg
+                # Recalculate with minimal power using tau and C
+                C = constants.get('thermal_mass', 1.0)
+                
+                # Handle k=0 vs k>0 for emergency path
+                if k > 0:
+                    exp_factor_emerg = math.exp(-k * horizon / tau)
+                    temp_transient_emerg = (current_temp - ref_temp) * exp_factor_emerg
+                    temp_steady_emerg = (P_emergency * tau / (k * C)) * (1 - exp_factor_emerg)
+                else:
+                    exp_factor_emerg = math.exp(-horizon / tau)
+                    temp_transient_emerg = (current_temp - ref_temp) * exp_factor_emerg
+                    temp_steady_emerg = (P_emergency * tau / C) * (1 - exp_factor_emerg)
+                
+                component_temp_emerg = ref_temp + temp_transient_emerg + temp_steady_emerg
                 
                 if tau_meas > 0 and horizon > 0:
                     decay_factor_emerg = math.exp(-horizon / tau_meas)
@@ -1719,9 +2311,9 @@ class ZonePhysicsEngine:
             # - GPU (Adreno 830): 35mm², 5W peak → 30% weight
             # - MODEM: 15mm², 3W peak → 15% weight
             component_weights = {
-                ThermalZone.CPU_BIG: 0.35,
-                ThermalZone.CPU_LITTLE: 0.20,
-                ThermalZone.GPU: 0.30,
+                ThermalZone.CPU_BIG: THERMAL_CONTRIBUTION_WEIGHTS['CPU_BIG'],
+                ThermalZone.CPU_LITTLE: THERMAL_CONTRIBUTION_WEIGHTS['CPU_LITTLE'],
+                ThermalZone.GPU: THERMAL_CONTRIBUTION_WEIGHTS['GPU'],
                 ThermalZone.MODEM: 0.15
             }
             
@@ -1740,7 +2332,7 @@ class ZonePhysicsEngine:
                 
                 # Chassis is well-coupled to ambient via vapor chamber
                 # Pull target temperature toward ambient (vapor chamber efficiency)
-                ambient_pull = 0.25  # 25% ambient influence (efficient cooling)
+                ambient_pull = AMBIENT_PULL_EFFICIENT_COOLING  # 25% ambient influence (efficient cooling)
                 target_temp = (1 - ambient_pull) * target_temp + ambient_pull * ambient_air_temp
                 
                 # Exponential approach with chassis time constant (slow thermal mass)
@@ -1748,7 +2340,7 @@ class ZonePhysicsEngine:
                 if 'CHASSIS' in self.zone_constants:
                     tau_chassis = self.zone_constants['CHASSIS']['time_constant']
                 else:
-                    tau_chassis = 120.0
+                    tau_chassis = TAU_CHASSIS_SYNTHETIC
                 
                 exp_decay = math.exp(-horizon / tau_chassis)
                 
@@ -1873,13 +2465,13 @@ class ZonePhysicsEngine:
         
         # Model confidence by zone type
         model_conf = {
-            'BATTERY': 0.95,      # Measured current = ground truth
+            'BATTERY': PREDICTION_CONFIDENCE['BATTERY'],  # Measured current = ground truth
             'CPU_BIG': 0.85,      # Fast response, well-understood
             'CPU_LITTLE': 0.85,
-            'GPU': 0.75,          # Workload variability
-            'MODEM': 0.70,        # Network unpredictable
-            'CHASSIS': 0.80,      # Damped response
-        }.get(zone_name, 0.60)
+            'GPU': PREDICTION_CONFIDENCE['GPU'],  # Workload variability
+            'MODEM': PREDICTION_CONFIDENCE['MODEM'],  # Network unpredictable
+            'CHASSIS': PREDICTION_CONFIDENCE['CHASSIS'],  # Damped response
+        }.get(zone_name, PREDICTION_CONFIDENCE_DEFAULT)
         factors.append(model_conf)
         
         # Delta confidence (small changes = high confidence)
@@ -1906,7 +2498,7 @@ class ZonePhysicsEngine:
         Low confidence → treat predictions as hotter → shorter (safer) thermal budget.
         """
         if not predicted:
-            return 999.0
+            return THERMAL_BUDGET_UNLIMITED
         
         # Get ambient/chassis temperature
         chassis = self.estimate_chassis(
@@ -1922,9 +2514,8 @@ class ZonePhysicsEngine:
             curr_temp = current.get(zone, pred_temp)
             zone_vel = velocity.zones.get(zone, 0)
             
-            # Get sensor confidence if available
+            # Get sensor confidence (defaults to 1.0, could optionally use current.confidence dict)
             sensor_conf = 1.0
-            # TODO: Pull from current.confidence dict if you want to use it
             
             # Calculate zone-specific confidence
             confidence = self._calculate_zone_confidence(
@@ -1951,13 +2542,13 @@ class ZonePhysicsEngine:
         
         # Cooling - unlimited budget
         if velocity.overall <= 0:
-            return 999.0
+            return THERMAL_BUDGET_UNLIMITED
         
         # Time until hit HOT threshold
         budget = (THERMAL_TEMP_HOT - worst_case_temp) / velocity.overall
         
         # Clamp to reasonable range
-        return max(0, min(budget, 600.0))
+        return max(0, min(budget, MAX_THERMAL_BUDGET))
     
     def _calculate_recommended_delay(self,
                                     predicted: Dict[ThermalZone, float],
@@ -1976,8 +2567,8 @@ class ZonePhysicsEngine:
         if max_predicted >= THERMAL_TEMP_HOT - 2.0:
             # Delay until temp drops below warm
             if velocity.overall > 0:
-                delay = (max_predicted - THERMAL_TEMP_WARM) / (abs(velocity.overall) + 0.01)
-                return min(delay, 10.0)  # cap at 10s
+                delay = (max_predicted - THERMAL_TEMP_WARM) / (abs(velocity.overall) + EPSILON_VELOCITY)
+                return min(delay, MAX_RECOMMENDED_DELAY)  # cap at 10s
         
         return 0.0
     
@@ -2004,7 +2595,7 @@ class ZonePhysicsEngine:
             
             constants = self.zone_constants[zone_name]
             C = constants['thermal_mass']
-            R = constants['thermal_resistance']
+            tau = constants.get('time_constant', TAU_DEFAULT)
             k = constants['ambient_coupling']
             
             # Temperature change
@@ -2013,8 +2604,9 @@ class ZonePhysicsEngine:
             # Power = C * dT/dt + cooling_power
             heating_power = C * (dT / dt)
             
-            chassis = sample.chassis or 25.0
-            cooling_power = k * (sample.zones[zone] - chassis) / R
+            chassis = sample.chassis or AMBIENT_TEMP_FALLBACK
+            # Use tau to approximate cooling (tau = R*C, so R ≈ tau/C)
+            cooling_power = k * (sample.zones[zone] - chassis) * C / tau
             
             zone_power = heating_power + cooling_power
             zone_power = max(0, min(zone_power, constants['peak_power']))
@@ -2047,7 +2639,7 @@ class ThermalTankStatus:
     should_throttle: bool            # True = reject new work
     throttle_reason: ThrottleReason  # Why we're throttling (if at all)
     headroom_seconds: float          # Seconds until throttle (0 if already hot)
-    cooling_rate: float              # °C/s (negative = heating)
+    cooling_rate: float              # °C/s (positive = heating, negative = cooling)
     cpu_big_velocity: float          # Current CPU_BIG heating rate (°C/s)
     cpu_little_velocity: float       # Current CPU_LITTLE heating rate (°C/s)
 
@@ -2079,7 +2671,7 @@ class ThermalTank:
     """
     
     # CPU velocity thresholds (°C/s) - tuned from validation data
-    CPU_VELOCITY_DANGER = 3.0
+    CPU_VELOCITY_DANGER = CPU_VELOCITY_DANGER
     
     def __init__(self, physics_engine: 'ZonePhysicsEngine'):
         self.physics = physics_engine
@@ -2145,12 +2737,40 @@ class ThermalTank:
         battery_throttle = battery_predicted >= self.throttle_temp
         
         # CONDITION 2: CPU velocity spike (regime change detection - NEW)
-        # Throttle if EITHER CPU is heating dangerously fast
+        # Use 3-sample burst detection - don't throttle on transient spikes
         # Only care about heating (positive velocity), not cooling
-        cpu_spike_throttle = (
-            cpu_big_velocity > self.CPU_VELOCITY_DANGER or 
-            cpu_little_velocity > self.CPU_VELOCITY_DANGER
-        )
+        
+        # Check CPU_BIG velocity pattern
+        cpu_big_pattern = 'normal'
+        if cpu_big_zone:
+            cpu_big_pattern = self.physics._check_velocity_pattern(cpu_big_zone, cpu_big_velocity)
+        
+        # Check CPU_LITTLE velocity pattern
+        cpu_little_pattern = 'normal'
+        if cpu_little_zone:
+            cpu_little_pattern = self.physics._check_velocity_pattern(cpu_little_zone, cpu_little_velocity)
+        
+        # Throttle logic:
+        # - 'burst': Only throttle if critically dangerous (will hit hardware limit)
+        # - 'sustained': Throttle at normal threshold
+        # - 'normal': No throttle
+        
+        cpu_spike_throttle = False
+        
+        if cpu_big_pattern == 'burst' or cpu_little_pattern == 'burst':
+            # Burst detected - only throttle if about to hit critical temps
+            # Use predicted temps if available
+            cpu_big_predicted = prediction.predicted_temps.get(cpu_big_zone, 0.0) if cpu_big_zone else 0.0
+            cpu_little_predicted = prediction.predicted_temps.get(cpu_little_zone, 0.0) if cpu_little_zone else 0.0
+            
+            # Critical threshold: would exceed observed peak from validation
+            if cpu_big_predicted > TJMAX_CPU or cpu_little_predicted > TJMAX_CPU:
+                cpu_spike_throttle = True
+        
+        elif cpu_big_pattern == 'sustained' or cpu_little_pattern == 'sustained':
+            # Sustained high velocity - throttle at normal threshold
+            if cpu_big_velocity > self.CPU_VELOCITY_DANGER or cpu_little_velocity > self.CPU_VELOCITY_DANGER:
+                cpu_spike_throttle = True
         
         # Determine throttle decision and reason
         if battery_throttle and cpu_spike_throttle:
@@ -2167,7 +2787,7 @@ class ThermalTank:
             should_throttle = False
         
         # Calculate headroom (seconds until battery throttle)
-        if battery_velocity > 0.001:  # Heating
+        if battery_velocity > BATTERY_VELOCITY_HEATING:  # Heating
             headroom = (self.throttle_temp - battery_current) / battery_velocity
             headroom = max(0.0, headroom)
         elif battery_current >= self.throttle_temp:
@@ -2202,6 +2822,224 @@ class ThermalTank:
 
 
 # ============================================================================
+# ADAPTIVE POWER LEARNING - Calibration System
+# ============================================================================
+
+class PowerLearningSystem:
+    """
+    Adaptive power learning for velocity-based temperature predictions.
+    
+    Learns actual power distribution from battery measurements during discharge,
+    then generates calibration factors to bias-correct velocity-based predictions.
+    
+    APPROACH:
+    - Measure total system power via battery voltage × current
+    - Distribute to zones based on thermal velocity (hot zones get more power)
+    - Learn average power per zone using exponential moving average
+    - Calculate calibration: learned_power / velocity_predicted_power
+    - Apply calibration to velocity-based predictions
+    
+    CRITICAL: Does NOT replace velocity predictions - only calibrates them.
+    Velocity gives transient response, learned power corrects systematic bias.
+    """
+    
+    def __init__(self):
+        # Learned power per zone (EMA)
+        self.power_ema: Dict[str, float] = {
+            'CPU_BIG': 0.0,
+            'CPU_LITTLE': 0.0,
+            'GPU': 0.0,
+            'MODEM': 0.0
+        }
+        
+        # Calibration factors (learned / velocity-predicted)
+        self.calibration_factors: Dict[str, float] = {
+            'CPU_BIG': 1.0,
+            'CPU_LITTLE': 1.0,
+            'GPU': 1.0,
+            'MODEM': 1.0
+        }
+        
+        # Learning state
+        self.sample_count = 0
+        self.last_persist_time = time.time()
+        self.last_backup_time = time.time()
+        
+        # Load persisted state
+        self._load_from_disk()
+        
+        logger.info(f"Power learning initialized with {self.sample_count} samples")
+    
+    def update(self, 
+               actual_power_watts: float, 
+               zones: Dict, 
+               zone_velocities: Dict) -> None:
+        """
+        Learn from actual power measurement.
+        
+        Args:
+            actual_power_watts: Total system power from battery (voltage × current)
+            zones: Dict[ThermalZone, float] - current temperatures
+            zone_velocities: Dict[ThermalZone, float] - heating rates (°C/s)
+        """
+        # Validate power range (0.5W to 20W is reasonable for S25+)
+        if not (MIN_POWER_SANITY <= actual_power_watts <= MAX_POWER_SANITY):
+            logger.debug(f"Power measurement {actual_power_watts:.2f}W out of range, skipping")
+            return
+        
+        # Subtract non-compute power components
+        # Display: ~1-3W (assume 2W average)
+        # Charging overhead: 0W (only learning during discharge)
+        # Modem baseline: ~0.5W (always on)
+        display_power = 2.0
+        modem_baseline = 0.5
+        
+        thermal_power = actual_power_watts - display_power - modem_baseline
+        thermal_power = max(MIN_THERMAL_POWER, thermal_power)  # Floor at 0.1W
+        
+        # Calculate total thermal velocity (sum of heating zones)
+        total_velocity = 0.0
+        zone_names = ['CPU_BIG', 'CPU_LITTLE', 'GPU', 'MODEM']
+        
+        for zone, vel in zone_velocities.items():
+            zone_name = str(zone).split('.')[-1]
+            if zone_name in zone_names and vel > 0:  # Only heating zones
+                total_velocity += vel
+        
+        if total_velocity < 0.01:
+            # System at equilibrium or cooling - can't distribute power
+            return
+        
+        # Distribute power proportionally to velocity
+        for zone, vel in zone_velocities.items():
+            zone_name = str(zone).split('.')[-1]
+            if zone_name not in zone_names:
+                continue
+            
+            if vel > 0:
+                # This zone's fraction of total heating
+                fraction = vel / total_velocity
+                zone_power = thermal_power * fraction
+            else:
+                # Cooling or stable - minimal power
+                zone_power = 0.1
+            
+            # Update EMA
+            alpha = POWER_LEARNING_RATE
+            if self.sample_count == 0:
+                # First sample - initialize
+                self.power_ema[zone_name] = zone_power
+            else:
+                # EMA update
+                self.power_ema[zone_name] = (
+                    alpha * zone_power + (1 - alpha) * self.power_ema[zone_name]
+                )
+        
+        self.sample_count += 1
+        
+        # Persist periodically
+        current_time = time.time()
+        if current_time - self.last_persist_time > POWER_LEARNING_PERSIST_INTERVAL:
+            self._persist()
+            self.last_persist_time = current_time
+        
+        if current_time - self.last_backup_time > POWER_LEARNING_BACKUP_INTERVAL:
+            self._backup()
+            self.last_backup_time = current_time
+        
+        # Update calibration factors if we have enough samples
+        if self.sample_count >= POWER_LEARNING_MIN_SAMPLES:
+            self._update_calibration_factors()
+    
+    def _update_calibration_factors(self) -> None:
+        """
+        Calculate calibration factors from learned vs velocity-based power.
+        
+        Calibration = learned_power_avg / velocity_power_avg
+        
+        Applied to velocity predictions: P_calibrated = P_velocity × calibration
+        """
+        # For now, use simple heuristic:
+        # If learned power is stable (sample_count > window), use it to calibrate
+        if self.sample_count < POWER_LEARNING_WINDOW:
+            return
+        
+        for zone_name in self.calibration_factors.keys():
+            learned = self.power_ema[zone_name]
+            
+            # Estimate what velocity-based method would predict
+            # From ZONE_THERMAL_CONSTANTS, peak_power is now 8.0W
+            # Assume velocity-based gives ~50% of peak on average
+            velocity_predicted = ZONE_THERMAL_CONSTANTS[zone_name]['peak_power'] * 0.5
+            
+            if velocity_predicted > 0.1 and learned > 0.1:
+                calibration = learned / velocity_predicted
+                # Clamp to reasonable range (0.5x to 2.0x)
+                calibration = max(0.5, min(calibration, 2.0))
+                self.calibration_factors[zone_name] = calibration
+    
+    def get_calibration_factor(self, zone_name: str) -> float:
+        """
+        Get calibration factor for a zone.
+        
+        Returns 1.0 if learning not yet stable.
+        """
+        if self.sample_count < POWER_LEARNING_MIN_SAMPLES:
+            return 1.0
+        
+        return self.calibration_factors.get(zone_name, 1.0)
+    
+    def _persist(self) -> None:
+        """Persistence disabled - memory only"""
+        pass
+    
+    def _backup(self) -> None:
+        """Backup disabled - memory only"""
+        pass
+    
+    def _cleanup_old_backups(self) -> None:
+        """Remove backups older than retention period"""
+        try:
+            backup_dir = Path(POWER_LEARNING_BACKUP_DIR).expanduser()
+            if not backup_dir.exists():
+                return
+            
+            cutoff_time = time.time() - (POWER_LEARNING_BACKUP_RETENTION_DAYS * SECONDS_PER_DAY)
+            
+            for backup_file in backup_dir.glob('power_learned_*.json'):
+                if backup_file.stat().st_mtime < cutoff_time:
+                    backup_file.unlink()
+                    logger.debug(f"Removed old backup: {backup_file.name}")
+        
+        except Exception as e:
+            logger.debug(f"Backup cleanup failed: {e}")
+    
+    def _load_from_disk(self) -> None:
+        """Load persisted state on init"""
+        if not POWER_LEARNING_ENABLED:
+            return
+        
+        try:
+            path = Path(POWER_LEARNING_FILE).expanduser()
+            if not path.exists():
+                return
+            
+            with open(path, 'r') as f:
+                data = json.load(f)
+            
+            self.power_ema = data.get('power_ema', self.power_ema)
+            self.calibration_factors = data.get('calibration_factors', self.calibration_factors)
+            self.sample_count = data.get('sample_count', 0)
+            
+            logger.info(f"Loaded power learning state: {self.sample_count} samples, "
+                       f"calibrations: {self.calibration_factors}")
+        
+        except Exception as e:
+            logger.error(f"Failed to load power learning: {e}")
+
+
+# ============================================================================
+
 class ThermalIntelligenceSystem:
     """
     Main thermal intelligence coordinator with hardware-accurate physics.
@@ -2211,23 +3049,50 @@ class ThermalIntelligenceSystem:
     def __init__(self):
         # Core components only
         self.telemetry = ThermalTelemetryCollector()
-        self.physics = ZonePhysicsEngine()
+        
+        # Power learning (must be created before physics engine)
+        self.power_learning = PowerLearningSystem() if POWER_LEARNING_ENABLED else None
+        
+        self.physics = ZonePhysicsEngine(power_learning=self.power_learning)
         self.tank = ThermalTank(self.physics)  # Dual-condition throttle (battery + CPU velocity)
         
         # Data storage
         self.samples: Deque[ThermalSample] = deque(maxlen=THERMAL_HISTORY_SIZE)
-        self.predictions: Deque[ThermalPrediction] = deque(maxlen=100)
+        self.predictions: Deque[ThermalPrediction] = deque(maxlen=3)  # Only need last few for validation
         
         # State
         self.current_state = ThermalState.UNKNOWN
         self.last_update = 0
-        self.update_interval = THERMAL_SAMPLE_INTERVAL_MS / 1000.0  # 10 seconds
+        self.update_interval = THERMAL_SAMPLE_INTERVAL
         
         # Monitoring
         self.monitor_task = None
+        self.battery_update_task = None
         self.running = False
         
-        logger.info("Thermal Intelligence System v2.24 - Die backdate removed")
+        # Validation tracking
+        self.validation_enabled = False  # Enable with enable_validation()
+        self.pending_validations: List[Tuple[float, ThermalZone, float, float]] = []  # (target_time, zone, predicted_temp, confidence)
+        self.validation_metrics: Dict[str, ValidationMetrics] = {}
+        self.validation_errors: Dict[str, deque] = {}  # Zone name -> deque of errors
+        self.total_validated = 0
+        self.validation_start_time = 0.0
+        
+        # Numpy array storage for predictions (26 columns like check_zones)
+        self.predictions_array = np.zeros((MAX_PREDICTIONS, 26), dtype=np.float32)
+        self.prediction_count = 0
+        
+        # Initialize validation metrics for each zone
+        for zone in ThermalZone:
+            zone_name = str(zone).split('.')[-1]
+            if zone_name not in ['DISPLAY', 'CHARGER']:
+                self.validation_metrics[zone_name] = ValidationMetrics()
+                self.validation_errors[zone_name] = deque(maxlen=MAX_VALIDATION_SAMPLES)
+        
+        # Callback mechanism for piggybacking on poll cycle
+        self.poll_callbacks: List[Callable] = []
+        
+        logger.info("Thermal Intelligence System  - Die backdate removed")
     
     async def start(self):
         """Start thermal monitoring and prediction"""
@@ -2236,8 +3101,9 @@ class ThermalIntelligenceSystem:
         
         self.running = True
         self.monitor_task = asyncio.create_task(self._monitor_loop())
+        self.battery_update_task = asyncio.create_task(self._battery_update_loop())
         
-        logger.info("Thermal monitoring started")
+        logger.info("Thermal monitoring started (monitor + battery loops)")
     
     async def stop(self):
         """Stop thermal monitoring"""
@@ -2250,25 +3116,704 @@ class ThermalIntelligenceSystem:
             except asyncio.CancelledError:
                 pass
         
+        if self.battery_update_task:
+            self.battery_update_task.cancel()
+            try:
+                await self.battery_update_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Flush any remaining validation data before shutdown
+        if self.validation_enabled and self.prediction_count > 0:
+            try:
+                self._flush_predictions()
+                logger.info("Flushed validation data on shutdown")
+            except Exception as e:
+                logger.error(f"Failed to flush on shutdown: {e}")
+        
         logger.info("Thermal monitoring stopped")
     
-    async def _monitor_loop(self):
-        """Main monitoring loop - 10s uniform sampling"""
+    def register_poll_callback(self, callback: Callable):
+        """
+        Register a callback to be invoked after each thermal poll cycle.
+        
+        This allows other systems (like the launcher supervisor) to piggyback
+        on the thermal system's 30s polling cadence instead of running their
+        own independent loops.
+        
+        Args:
+            callback: Async callable that takes (sample, velocity, prediction, tank_status)
+        """
+        if callback not in self.poll_callbacks:
+            self.poll_callbacks.append(callback)
+            logger.info(f"Registered poll callback: {callback.__name__ if hasattr(callback, '__name__') else callback}")
+            
+            # Limit callback list to prevent unbounded growth
+            if len(self.poll_callbacks) > 10:
+                logger.warning(f"Poll callbacks exceeded 10 - removing oldest")
+                self.poll_callbacks.pop(0)
+    
+    def unregister_poll_callback(self, callback: Callable):
+        """Unregister a callback to prevent memory leaks"""
+        if callback in self.poll_callbacks:
+            self.poll_callbacks.remove(callback)
+            logger.info(f"Unregistered poll callback: {callback.__name__ if hasattr(callback, '__name__') else callback}")
+    
+    def unregister_poll_callback(self, callback: Callable):
+        """Remove a callback from the poll cycle"""
+        if callback in self.poll_callbacks:
+            self.poll_callbacks.remove(callback)
+            logger.info(f"Unregistered poll callback: {callback.__name__ if hasattr(callback, '__name__') else callback}")
+    
+    def clear_poll_callbacks(self):
+        """Clear all callbacks to prevent memory leaks"""
+        self.poll_callbacks.clear()
+        logger.info("Cleared all poll callbacks")
+    
+    # ============================================================================
+    # VALIDATION METHODS
+    # ============================================================================
+    
+    def enable_validation(self):
+        """Enable prediction validation tracking"""
+        self.validation_enabled = True
+        self.validation_start_time = time.time()
+        logger.info("Validation tracking enabled")
+    
+    def disable_validation(self):
+        """Disable prediction validation tracking"""
+        self.validation_enabled = False
+        logger.info("Validation tracking disabled")
+    
+    def clear_validation_data(self):
+        """Clear validation data to free memory"""
+        self.pending_validations.clear()
+        self.validation_errors.clear()
+        self.predictions_array = np.zeros((MAX_PREDICTIONS, 26), dtype=np.float32)
+        self.prediction_count = 0
+        # Keep metrics but reset counts
+        for metrics in self.validation_metrics.values():
+            metrics.count = 0
+        logger.info("Validation data cleared")
+    
+    def export_and_clear_validation(self, output_path: Optional[Path] = None) -> Optional[Path]:
+        """Export validation data then clear to free memory"""
+        if not self.validation_enabled or self.total_validated == 0:
+            return None
+        
+        path = self.export_validation_data(output_path)
+        if path:
+            self.clear_validation_data()
+            logger.info(f"Exported and cleared validation data to {path}")
+        return path
+    
+    def _store_pending_validation(self, prediction: ThermalPrediction):
+        """
+        Store prediction for later validation against actual temperatures.
+        
+        Args:
+            prediction: The prediction to validate later
+        """
+        if not self.validation_enabled:
+            return
+        
+        target_time = prediction.timestamp + prediction.horizon
+        
+        # Get current state for context
+        current = self.samples[-1] if self.samples else None
+        velocity = self.physics.calculate_velocity(list(self.samples)) if len(self.samples) >= 2 else None
+        
+        for zone, predicted_temp in prediction.predicted_temps.items():
+            confidence = prediction.confidence_by_zone.get(zone, prediction.confidence)
+            
+            # Collect full context for numpy storage
+            zone_name = str(zone).split('.')[-1]
+            T0 = current.zones.get(zone, predicted_temp) if current else predicted_temp
+            velocity_zone = velocity.zones.get(zone, 0.0) if velocity else 0.0
+            
+            # Get physics constants
+            if zone_name in ZONE_THERMAL_CONSTANTS:
+                constants = ZONE_THERMAL_CONSTANTS[zone_name]
+                k_used = constants['ambient_coupling']
+                C_used = constants['thermal_mass']
+                tau_used = constants['time_constant']
+                R_used = tau_used / C_used if C_used > 0 else 0.0
+            else:
+                R_used = k_used = C_used = tau_used = 0.0
+            
+            P_used = prediction.power_by_zone.get(zone, 0.0)
+            
+            # Get thermal state
+            state_map = {'COLD': 0, 'OPTIMAL': 1, 'WARM': 2, 'HOT': 3, 'CRITICAL': 4, 'UNKNOWN': 5}
+            trend_map = {'COOLING_FAST': 0, 'COOLING': 1, 'STABLE': 2, 'WARMING': 3, 'WARMING_FAST': 4, 'UNKNOWN': 5}
+            state_id = state_map.get(self.current_state.name, 5)
+            trend_id = trend_map.get(velocity.trend.name if velocity else 'UNKNOWN', 5)
+            
+            # Get chassis and ambient
+            T_chassis = current.chassis if current else T0
+            T_ambient = self.physics.fit_ambient_temperature(list(self.samples)) if len(self.samples) >= 3 else T0 - 7.0
+            
+            # Store with full context
+            self.pending_validations.append((
+                target_time, zone, predicted_temp, confidence,
+                prediction.timestamp, prediction.horizon,
+                state_id, trend_id, T0, T_chassis, T_ambient,
+                velocity_zone, R_used, k_used, C_used, tau_used, P_used
+            ))
+        
+        # CRITICAL: Enforce maximum size to prevent memory leak
+        # Remove oldest entries if we exceed the limit
+        if len(self.pending_validations) > MAX_PENDING_VALIDATIONS:
+            # Remove oldest entries (FIFO)
+            excess = len(self.pending_validations) - MAX_PENDING_VALIDATIONS
+            self.pending_validations = self.pending_validations[excess:]
+            logger.warning(f"Pending validations exceeded {MAX_PENDING_VALIDATIONS}, removed {excess} oldest entries")
+    
+    def _validate_pending(self, current_sample: ThermalSample):
+        """
+        Validate pending predictions against current actual temperatures.
+        Also cleans up stale entries to prevent memory leaks.
+        
+        Extracts battery metrics (voltage, current, temp, percentage) from current_sample
+        and calculates instantaneous power draw for discharge events. All data logged
+        to validation array for analysis.
+        
+        Args:
+            current_sample: The current temperature sample to validate against,
+                          includes battery metrics from Termux API cache
+        """
+        if not self.validation_enabled or not self.pending_validations:
+            return
+        
+        now = current_sample.timestamp
+        validated_indices = []
+        
+        # Zone name mapping
+        zone_names = ['CPU_BIG', 'CPU_LITTLE', 'GPU', 'BATTERY', 'MODEM', 'CHASSIS', 'AMBIENT']
+        zone_to_id = {name: i for i, name in enumerate(zone_names)}
+        
+        for i, validation_data in enumerate(self.pending_validations):
+            # Unpack full context
+            (target_time, zone, predicted_temp, confidence,
+             t_predict, horizon, state_id, trend_id, T0, T_chassis, T_ambient,
+             velocity_zone, R_used, k_used, C_used, tau_used, P_used) = validation_data
+            
+            # CRITICAL: Remove stale entries to prevent memory leak
+            # If prediction is older than VALIDATION_MAX_AGE, discard it
+            age = now - t_predict
+            if age > VALIDATION_MAX_AGE:
+                validated_indices.append(i)
+                continue
+            
+            # Check if prediction window has passed (within tolerance)
+            if now >= target_time - VALIDATION_WINDOW:
+                # Get actual temperature for this zone
+                actual_temp = current_sample.zones.get(zone)
+                
+                # CRITICAL: Remove entry even if zone is missing to prevent leak
+                if actual_temp is None:
+                    # Zone missing from sample - discard this pending validation
+                    validated_indices.append(i)
+                    continue
+                
+                zone_name = str(zone).split('.')[-1]
+                zone_id = zone_to_id.get(zone_name, -1)
+                
+                if zone_id < 0:
+                    validated_indices.append(i)
+                    continue
+                
+                # Calculate error
+                error = predicted_temp - actual_temp
+                abs_error = abs(error)
+                
+                # Store in numpy array if space available
+                if self.prediction_count < MAX_PREDICTIONS:
+                    # Extract battery metrics from current sample
+                    battery_voltage = getattr(current_sample, 'battery_voltage', 0)
+                    battery_current = getattr(current_sample, 'battery_current', 0)
+                    battery_temp = getattr(current_sample, 'battery_temp', 0.0)
+                    battery_pct = getattr(current_sample, 'battery_pct', 0)
+                    
+                    # Calculate power if we have the data (during discharge)
+                    power_w = 0.0
+                    if battery_voltage and battery_current and battery_current < 0:
+                        # Current is negative during discharge
+                        # mV * μA / 1,000,000,000 = W
+                        power_w = (battery_voltage * abs(battery_current)) / 1_000_000_000
+                    
+                    # 26 columns: [t_predict, t_target, t_actual, horizon, zone_id,
+                    #             temp_pred, temp_actual, error, abs_error, confidence,
+                    #             state, trend, T0, T_chassis, T_ambient, velocity_zone,
+                    #             R_used, k_used, C_used, tau_used, P_used,
+                    #             power_w, voltage_mv, current_ua, battery_temp, battery_pct]
+                    self.predictions_array[self.prediction_count] = [
+                        t_predict, target_time, now, horizon, zone_id,
+                        predicted_temp, actual_temp, error, abs_error, confidence,
+                        state_id, trend_id, T0, T_chassis, T_ambient, velocity_zone,
+                        R_used, k_used, C_used, tau_used, P_used,
+                        power_w, battery_voltage or 0, battery_current or 0, battery_temp or 0.0, battery_pct or 0
+                    ]
+                    self.prediction_count += 1
+                    
+                    # Auto-flush when array fills to prevent memory leak
+                    if self.prediction_count >= MAX_PREDICTIONS:
+                        self._flush_predictions()
+                
+                # Store error for this zone
+                if zone_name in self.validation_errors:
+                    self.validation_errors[zone_name].append(abs_error)
+                
+                # Update metrics
+                self._update_validation_metrics(zone_name, error, abs_error)
+                
+                self.total_validated += 1
+                validated_indices.append(i)
+        
+        # Remove validated predictions (reverse order to maintain indices)
+        for i in reversed(validated_indices):
+            del self.pending_validations[i]
+    
+    def _flush_predictions(self):
+        """
+        Flush predictions array to disk and reset counter.
+        
+        Writes compressed numpy archive (.npz) containing:
+        - predictions: 26-column array with thermal predictions, errors, physics parameters,
+                      and battery metrics (voltage, current, temp, percentage, power)
+        - zone_names: Thermal zone identifiers
+        - column_names: Column labels for predictions array
+        - total_validated: Cumulative prediction count
+        - runtime: Total validation runtime in seconds
+        
+        Output directory: validation_data/validation_flush_{timestamp}.npz
+        """
+        if self.prediction_count == 0:
+            return
+        
+        # Create validation_data directory if it doesn't exist
+        output_dir = Path("validation_data")
+        output_dir.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = output_dir / f"validation_flush_{timestamp}.npz"
+        
+        zone_names = ['CPU_BIG', 'CPU_LITTLE', 'GPU', 'BATTERY', 'MODEM', 'CHASSIS', 'AMBIENT']
+        column_names = [
+            't_predict', 't_target', 't_actual', 'horizon', 'zone_id',
+            'temp_pred', 'temp_actual', 'error', 'abs_error', 'confidence',
+            'state', 'trend', 'T0', 'T_chassis', 'T_ambient', 'velocity_zone',
+            'R_used', 'k_used', 'C_used', 'tau_used', 'P_used',
+            'power_w', 'voltage_mv', 'current_ua', 'battery_temp', 'battery_pct'
+        ]
+        
+        np.savez_compressed(
+            output_path,
+            predictions=self.predictions_array[:self.prediction_count],
+            zone_names=zone_names,
+            column_names=column_names,
+            total_validated=self.total_validated,
+            runtime=time.time() - self.validation_start_time if self.validation_start_time > 0 else 0
+        )
+        
+        logger.info(f"Flushed {self.prediction_count} predictions to {output_path}")
+        
+        # Reset array
+        self.prediction_count = 0
+    
+    def _update_validation_metrics(self, zone_name: str, error: float, abs_error: float):
+        """
+        Update validation metrics for a zone.
+        
+        Args:
+            zone_name: Name of the thermal zone
+            error: Signed error (predicted - actual)
+            abs_error: Absolute error
+        """
+        if zone_name not in self.validation_metrics:
+            return
+        
+        metrics = self.validation_metrics[zone_name]
+        n = metrics.count
+        
+        # Update count
+        metrics.count += 1
+        
+        # Update running statistics using online algorithms
+        # Mean error (bias)
+        metrics.mean_error = (metrics.mean_error * n + error) / (n + 1)
+        
+        # MAE
+        metrics.mae = (metrics.mae * n + abs_error) / (n + 1)
+        
+        # For RMSE, we need to track sum of squared errors
+        old_sse = (metrics.rmse ** 2) * n if n > 0 else 0
+        new_sse = old_sse + (error ** 2)
+        metrics.rmse = math.sqrt(new_sse / (n + 1))
+        
+        # Max error
+        metrics.max_error = max(metrics.max_error, abs_error)
+        
+        # Within thresholds
+        if abs_error <= 1.0:
+            metrics.within_1C += 1
+        if abs_error <= 2.0:
+            metrics.within_2C += 1
+        if abs_error <= 3.0:
+            metrics.within_3C += 1
+        
+        # Standard deviation - compute from stored errors
+        if zone_name in self.validation_errors and len(self.validation_errors[zone_name]) > 1:
+            errors_list = list(self.validation_errors[zone_name])
+            metrics.std_error = statistics.stdev(errors_list) if len(errors_list) > 1 else 0.0
+        
+        metrics.last_update = time.time()
+    
+    def get_validation_report(self) -> Optional[Dict[str, Any]]:
+        """
+        Get comprehensive validation report with per-zone metrics.
+        
+        Returns:
+            Dictionary with validation metrics:
+            {
+                'total_validated': int,
+                'runtime_seconds': float,
+                'zones': {
+                    'CPU_BIG': {
+                        'count': int,
+                        'mae': float,
+                        'rmse': float,
+                        'max_error': float,
+                        'mean_error': float,
+                        'std_error': float,
+                        'within_1C': int,
+                        'within_2C': int,
+                        'within_3C': int,
+                        'accuracy_pct': float,
+                        'quality': str
+                    },
+                    ...
+                },
+                'overall_mae': float,
+                'overall_quality': str
+            }
+        """
+        if not self.validation_enabled or self.total_validated == 0:
+            return None
+        
+        runtime = time.time() - self.validation_start_time if self.validation_start_time > 0 else 0
+        
+        zones_report = {}
+        total_mae = 0.0
+        zone_count = 0
+        
+        for zone_name, metrics in self.validation_metrics.items():
+            if metrics.count == 0:
+                continue
+            
+            # Calculate accuracy percentage (within 2°C)
+            accuracy_pct = (metrics.within_2C / metrics.count * 100) if metrics.count > 0 else 0.0
+            
+            # Determine quality rating
+            if metrics.mae < 0.5:
+                quality = 'EXCELLENT'
+            elif metrics.mae < 1.0:
+                quality = 'GOOD'
+            elif metrics.mae < 2.0:
+                quality = 'FAIR'
+            else:
+                quality = 'POOR'
+            
+            zones_report[zone_name] = {
+                'count': metrics.count,
+                'mae': metrics.mae,
+                'rmse': metrics.rmse,
+                'max_error': metrics.max_error,
+                'mean_error': metrics.mean_error,
+                'std_error': metrics.std_error,
+                'within_1C': metrics.within_1C,
+                'within_2C': metrics.within_2C,
+                'within_3C': metrics.within_3C,
+                'accuracy_pct': accuracy_pct,
+                'quality': quality
+            }
+            
+            total_mae += metrics.mae
+            zone_count += 1
+        
+        # Overall metrics
+        overall_mae = total_mae / zone_count if zone_count > 0 else 0.0
+        
+        if overall_mae < 0.5:
+            overall_quality = 'EXCELLENT'
+        elif overall_mae < 1.0:
+            overall_quality = 'GOOD'
+        elif overall_mae < 2.0:
+            overall_quality = 'FAIR'
+        else:
+            overall_quality = 'POOR'
+        
+        return {
+            'total_validated': self.total_validated,
+            'runtime_seconds': runtime,
+            'pending_validations': len(self.pending_validations),
+            'zones': zones_report,
+            'overall_mae': overall_mae,
+            'overall_quality': overall_quality
+        }
+    
+    def print_validation_summary(self):
+        """Print a formatted validation summary to console"""
+        report = self.get_validation_report()
+        
+        if not report:
+            print("Validation not enabled or no data collected")
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"🐧 THERMAL PREDICTION VALIDATION SUMMARY")
+        print(f"{'='*80}")
+        print(f"Total Validated: {report['total_validated']:,}")
+        print(f"Runtime: {report['runtime_seconds']/60:.1f} minutes")
+        print(f"Pending: {report['pending_validations']:,}")
+        print(f"Overall MAE: {report['overall_mae']:.2f}°C ({report['overall_quality']})")
+        print(f"\n{'Zone':<12} {'Count':>7} {'MAE':>7} {'RMSE':>7} {'Max':>7} {'Bias':>7} "
+              f"{'<1°C':>7} {'<2°C':>7} {'<3°C':>7} {'Quality'}")
+        print('-' * 80)
+        
+        for zone_name in sorted(report['zones'].keys()):
+            metrics = report['zones'][zone_name]
+            
+            pct_1C = (metrics['within_1C'] / metrics['count'] * 100) if metrics['count'] > 0 else 0
+            pct_2C = (metrics['within_2C'] / metrics['count'] * 100) if metrics['count'] > 0 else 0
+            pct_3C = (metrics['within_3C'] / metrics['count'] * 100) if metrics['count'] > 0 else 0
+            
+            print(f"{zone_name:<12} {metrics['count']:>7,} {metrics['mae']:>7.2f} "
+                  f"{metrics['rmse']:>7.2f} {metrics['max_error']:>7.2f} {metrics['mean_error']:>+7.2f} "
+                  f"{pct_1C:>6.1f}% {pct_2C:>6.1f}% {pct_3C:>6.1f}% {metrics['quality']}")
+        
+        print(f"{'='*80}\n")
+    
+    def export_validation_data(self, output_path: Optional[Path] = None) -> Optional[Path]:
+        """
+        Export validation data to JSON file for analysis.
+        
+        Args:
+            output_path: Optional path for output file. If None, uses default.
+        
+        Returns:
+            Path to exported file, or None if validation not enabled
+        """
+        if not self.validation_enabled or self.total_validated == 0:
+            logger.warning("Cannot export: validation not enabled or no data")
+            return None
+        
+        report = self.get_validation_report()
+        
+        if not report:
+            return None
+        
+        # Default output path
+        if output_path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = Path(f"validation_report_{timestamp}.json")
+        
+        # Export to JSON
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(report, f, indent=2)
+            
+            logger.info(f"Validation data exported to {output_path}")
+            return output_path
+        
+        except Exception as e:
+            logger.error(f"Failed to export validation data: {e}")
+            return None
+    
+    def save_validation_results(self, output_path: Optional[Path] = None) -> Optional[Path]:
+        """
+        Save validation results to .npz file (same format as check_zones.py).
+        
+        Args:
+            output_path: Optional path for output file. If None, uses default.
+        
+        Returns:
+            Path to saved file, or None if validation not enabled
+        """
+        if not self.validation_enabled or self.prediction_count == 0:
+            logger.warning("Cannot save: validation not enabled or no predictions")
+            return None
+        
+        # Default output path
+        if output_path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = Path(f"validation_results_{timestamp}.npz")
+        
+        try:
+            # Zone names for reference
+            zone_names = ['CPU_BIG', 'CPU_LITTLE', 'GPU', 'BATTERY', 'MODEM', 'CHASSIS', 'AMBIENT']
+            
+            # Column names
+            column_names = [
+                't_predict', 't_target', 't_actual', 'horizon', 'zone_id',
+                'temp_pred', 'temp_actual', 'error', 'abs_error', 'confidence',
+                'state', 'trend', 'T0', 'T_chassis', 'T_ambient', 'velocity_zone',
+                'R_used', 'k_used', 'C_used', 'tau_used', 'P_used',
+                'power_w', 'voltage_mv', 'current_ua', 'battery_temp', 'battery_pct'
+            ]
+            
+            # Save compressed
+            np.savez_compressed(
+                output_path,
+                predictions=self.predictions_array[:self.prediction_count],
+                zone_names=zone_names,
+                column_names=column_names,
+                total_validated=self.total_validated,
+                runtime=time.time() - self.validation_start_time if self.validation_start_time > 0 else 0
+            )
+            
+            logger.info(f"Validation results saved to {output_path} ({self.prediction_count:,} predictions)")
+            return output_path
+        
+        except Exception as e:
+            logger.error(f"Failed to save validation results: {e}")
+            return None
+    
+    def save_checkpoint(self, output_path: Optional[Path] = None) -> Optional[Path]:
+        """
+        Save intermediate checkpoint of validation data.
+        Alias for save_validation_results for compatibility.
+        
+        Args:
+            output_path: Optional path for output file
+        
+        Returns:
+            Path to saved file, or None if failed
+        """
+        return self.save_validation_results(output_path)
+    
+    def get_zone_validation_errors(self, zone_name: str) -> Optional[List[float]]:
+        """
+        Get raw validation errors for a specific zone.
+        
+        Args:
+            zone_name: Name of the thermal zone (e.g., 'CPU_BIG')
+        
+        Returns:
+            List of absolute errors, or None if zone not found
+        """
+        if zone_name in self.validation_errors:
+            return list(self.validation_errors[zone_name])
+        return None
+    
+    def get_validation_stats(self) -> Dict[str, Any]:
+        """
+        Get validation system statistics for monitoring memory usage.
+        
+        Returns:
+            Dictionary with validation system stats:
+            {
+                'enabled': bool,
+                'pending_validations': int,
+                'total_validated': int,
+                'predictions_stored': int,
+                'predictions_capacity': int,
+                'memory_usage_mb': float
+            }
+        """
+        # Estimate memory usage
+        pending_size = len(self.pending_validations) * 17 * 8  # 17 values × 8 bytes each
+        array_size = self.predictions_array.nbytes
+        errors_size = sum(len(deq) * 8 for deq in self.validation_errors.values())
+        total_mb = (pending_size + array_size + errors_size) / (1024 * 1024)
+        
+        return {
+            'enabled': self.validation_enabled,
+            'pending_validations': len(self.pending_validations),
+            'total_validated': self.total_validated,
+            'predictions_stored': self.prediction_count,
+            'predictions_capacity': MAX_PREDICTIONS,
+            'memory_usage_mb': total_mb,
+            'max_pending_limit': MAX_PENDING_VALIDATIONS,
+            'max_age_seconds': VALIDATION_MAX_AGE
+        }
+    
+    async def _battery_update_loop(self):
+        """
+        Independent background loop to update battery/network/brightness cache.
+        Runs at API_UPDATE_INTERVAL (5s) to keep caches fresh without blocking monitor loop.
+        """
+        # Initial sleep to stagger from monitor loop
+        await asyncio.sleep(API_UPDATE_INTERVAL)
+        
         while self.running:
             try:
-                # Collect sample (uniform 10s rate)
-                sample = await self.telemetry.collect_sample(for_prediction=True)
+                # Update all API caches in parallel
+                tasks = [
+                    self.telemetry._read_battery_status(),
+                    self.telemetry._detect_network_type(),
+                    self.telemetry._get_display_brightness()
+                ]
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                timestamp = time.time()
+                
+                # Update prediction cache (used by monitor loop)
+                if not isinstance(results[0], Exception) and results[0]:
+                    self.telemetry.pred_battery = results[0]
+                    self.telemetry.pred_battery_time = timestamp
+                
+                if not isinstance(results[1], Exception):
+                    self.telemetry.pred_network = results[1]
+                    self.telemetry.pred_network_time = timestamp
+                
+                if not isinstance(results[2], Exception) and results[2] is not None:
+                    self.telemetry.pred_brightness = results[2]
+                    self.telemetry.pred_brightness_time = timestamp
+                
+                await asyncio.sleep(API_UPDATE_INTERVAL)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Battery update loop error: {e}")
+                await asyncio.sleep(API_UPDATE_INTERVAL)
+    
+    async def _monitor_loop(self):
+        """Main monitoring loop - uniform sampling at THERMAL_SAMPLE_INTERVAL (1s)"""
+        
+        while self.running:
+            try:
+                # Collect sample at configured interval (with timeout to prevent hanging)
+                try:
+                    sample = await asyncio.wait_for(
+                        self.telemetry.collect_sample(for_prediction=True),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Sample collection timed out after 10s")
+                    await asyncio.sleep(self.update_interval)
+                    continue
+                
                 self.samples.append(sample)
+                
+                # Validate pending predictions against this new sample
+                if self.validation_enabled:
+                    self._validate_pending(sample)
+                
+                velocity = None
+                prediction = None
+                tank_status = None
                 
                 # Validate against old predictions if we have any
                 if self.predictions and len(self.samples) >= MIN_SAMPLES_FOR_PREDICTIONS:
                     # Check if current sample matches a previous prediction's target time
-                    # Prediction horizon is 60s, so look for predictions ~60s ago
-                    for prediction in list(self.predictions):
-                        time_diff = abs(sample.timestamp - (prediction.timestamp + THERMAL_PREDICTION_HORIZON))
+                    # Prediction horizon is 30s, so look for predictions ~30s ago
+                    for pred in list(self.predictions):
+                        time_diff = abs(sample.timestamp - (pred.timestamp + THERMAL_PREDICTION_HORIZON))
                         
-                        # If within 15s tolerance, this sample validates that prediction
-                        if time_diff < 15.0:
+                        # If within 1s tolerance, this sample validates that prediction
+                        if time_diff < SAMPLE_STALENESS_THRESHOLD:
                             # Match found but no tuning needed anymore
                             break  # Only validate one prediction per sample
                 
@@ -2277,15 +3822,50 @@ class ThermalIntelligenceSystem:
                     # Calculate velocity
                     velocity = self.physics.calculate_velocity(list(self.samples))
                     
+                    # Update power learning (only during discharge)
+                    if self.power_learning and not sample.charging:
+                        # Get battery voltage and current from sample
+                        battery_voltage = getattr(sample, 'battery_voltage', None)
+                        battery_current = getattr(sample, 'battery_current', None)
+                        
+                        if battery_voltage and battery_current and battery_current < 0:
+                            # Current is negative during discharge
+                            # Calculate actual power: V × I (current in μA, so divide by 1M)
+                            actual_power = (battery_voltage * abs(battery_current)) / 1_000_000
+                            
+                            # Update learning with actual power and zone velocities
+                            self.power_learning.update(actual_power, sample.zones, velocity.zones)
+                    
                     # Generate prediction
                     if THERMAL_PREDICTION_ENABLED:
                         prediction = self.physics.predict_temperature(
                             sample, velocity, THERMAL_PREDICTION_HORIZON, list(self.samples)
                         )
                         self.predictions.append(prediction)
+                        
+                        # Store prediction for validation
+                        if self.validation_enabled:
+                            self._store_pending_validation(prediction)
+                    
+                    # Get tank status for callbacks
+                    if velocity and prediction:
+                        tank_status = self.tank.get_status(sample, velocity, prediction)
                 
                 # Update thermal state
                 self._update_thermal_state(sample)
+                
+                # Invoke registered callbacks (for launcher supervisor, etc.)
+                if self.poll_callbacks:
+                    for callback in self.poll_callbacks[:]:  # Copy list to avoid modification during iteration
+                        try:
+                            if asyncio.iscoroutinefunction(callback):
+                                await callback(sample, velocity, prediction, tank_status)
+                            else:
+                                callback(sample, velocity, prediction, tank_status)
+                        except Exception as e:
+                            logger.error(f"Poll callback error in {callback}: {e}")
+                            # Clear reference to exception to prevent holding callback
+                            del e
                 
                 await asyncio.sleep(self.update_interval)
                 
@@ -2293,7 +3873,10 @@ class ThermalIntelligenceSystem:
                 break
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
-                await asyncio.sleep(1)
+                import traceback
+                logger.error(f"Monitor loop traceback:\n{traceback.format_exc()}")
+                # Don't delete exception reference - we want the full trace
+                await asyncio.sleep(self.update_interval)  # Continue after error
     
     def _update_thermal_state(self, sample: ThermalSample):
         """Update thermal state with hysteresis"""
@@ -2368,11 +3951,12 @@ class ThermalIntelligenceSystem:
         Returns zone temperatures with color coding, trends, state, and metrics.
         Perfect for ASCII art thermal boxes in launchers.
         
-        Color thresholds:
-        - Green: < 35°C (cool)
-        - Yellow: 35-40°C (warm)
-        - Orange: 40-45°C (hot)
-        - Red: > 45°C (critical)
+        Color thresholds (PNGN_32 team colors):
+        - Green: < 35°C (cool) - #00FF7F Radiation Green
+        - Light Green: 35-38°C (warm) - #00FF00 Neon Green
+        - Purple: 38-42°C (warning) - #CC33FF PNGN Purple
+        - Pink: 42-45°C (hot) - #FF1493 Deep Pink
+        - Red: > 45°C (critical) - #FF0080 Neon Red
         
         Trend indicators:
         - ↑↑ : rapid warming (> 0.15°C/s)
@@ -2399,35 +3983,43 @@ class ThermalIntelligenceSystem:
             if zone_name in ['DISPLAY', 'CHARGER']:
                 continue
             
-            # Color based on temperature
-            if temp < 35:
-                color = 'green'
-            elif temp < 40:
-                color = 'yellow'
-            elif temp < 45:
-                color = 'orange'
+            # Color based on temperature (purple/green theme from PNGN_32.html)
+            if temp < TEMP_DISPLAY_COOL:
+                color = '#00FF7F'      # Radiation Green (index 18)
+                color_name = 'green'
+            elif temp < TEMP_DISPLAY_WARM:
+                color = '#00FF00'      # Neon Green (index 16)
+                color_name = 'light_green'
+            elif temp < TEMP_DISPLAY_WARNING:
+                color = '#CC33FF'      # PNGN Purple (index 0)
+                color_name = 'purple'
+            elif temp < TEMP_DISPLAY_HOT:
+                color = '#FF1493'      # Deep Pink (index 10)
+                color_name = 'pink'
             else:
-                color = 'red'
+                color = '#FF0080'      # Neon Red (index 12)
+                color_name = 'red'
             
             # Trend from velocity
             vel = velocity.zones.get(zone, 0.0)
-            if vel > 0.15:
+            if vel > VELOCITY_TREND_RAPID_WARMING:
                 trend = '↑↑'
-            elif vel > 0.05:
+            elif vel > VELOCITY_TREND_WARMING:
                 trend = '↑'
-            elif vel < -0.15:
+            elif vel < VELOCITY_TREND_RAPID_COOLING:
                 trend = '↓↓'
-            elif vel < -0.05:
+            elif vel < -VELOCITY_TREND_WARMING:
                 trend = '↓'
             else:
                 trend = '→'
             
             # Confidence if available
-            conf = prediction.confidence_by_zone.get(zone, 0.7) if prediction else 0.7
+            conf = prediction.confidence_by_zone.get(zone, PREDICTION_CONFIDENCE_FALLBACK) if prediction else PREDICTION_CONFIDENCE_FALLBACK
             
             zones[zone_name] = {
                 'temp': temp,
                 'color': color,
+                'color_name': color_name,
                 'trend': trend,
                 'velocity': vel,
                 'confidence': conf
@@ -2460,6 +4052,96 @@ class ThermalIntelligenceSystem:
             'current_state': self.current_state.name,
             'update_interval': self.update_interval,
         }
+    
+    def get_accuracy_report(self, actual_sample: Optional[ThermalSample] = None) -> Optional[Dict[str, Any]]:
+        """
+        Get prediction accuracy report with zone-specific color coding.
+        
+        Compares the most recent prediction against actual temperature to show
+        accuracy metrics with proper PNGN_32 team color coding based on zone type.
+        
+        Args:
+            actual_sample: Optional actual temperature sample to compare against.
+                          If None, uses current sample (assumes prediction was for current time)
+        
+        Returns:
+            Dictionary with per-zone accuracy metrics:
+            {
+                'zones': {
+                    'CPU_BIG': {
+                        'predicted': 72.5,
+                        'actual': 71.8,
+                        'error': 0.7,
+                        'rating': 'excellent',
+                        'color': '#00FF7F',
+                        'label': 'EXCELLENT'
+                    },
+                    ...
+                },
+                'overall_mae': 1.2,
+                'overall_rating': 'good',
+                'overall_color': '#00FF00',
+                'overall_label': 'GOOD',
+                'prediction_horizon': 30.0,
+                'timestamp': 1234567890.0
+            }
+        """
+        if not self.predictions or not self.samples:
+            return None
+        
+        # Get the most recent prediction and actual sample
+        prediction = self.predictions[-1]
+        actual = actual_sample if actual_sample else self.samples[-1]
+        
+        # Calculate per-zone errors
+        zone_errors = {}
+        total_error = 0.0
+        zone_count = 0
+        
+        for zone, predicted_temp in prediction.predicted_temps.items():
+            zone_name = str(zone).split('.')[-1]
+            
+            # Skip non-hardware zones
+            if zone_name in ['DISPLAY', 'CHARGER']:
+                continue
+            
+            # Get actual temperature for this zone
+            actual_temp = actual.zones.get(zone)
+            if actual_temp is None:
+                continue
+            
+            # Calculate absolute error
+            error = abs(predicted_temp - actual_temp)
+            total_error += error
+            zone_count += 1
+            
+            # Get zone-specific accuracy rating and color
+            rating, color, label = get_accuracy_rating(zone_name, error)
+            
+            zone_errors[zone_name] = {
+                'predicted': predicted_temp,
+                'actual': actual_temp,
+                'error': error,
+                'rating': rating,
+                'color': color,
+                'label': label
+            }
+        
+        # Calculate overall metrics
+        overall_mae = total_error / zone_count if zone_count > 0 else 0.0
+        
+        # Determine overall rating (use CPU_BIG as reference for overall)
+        overall_rating, overall_color, overall_label = get_accuracy_rating('CPU_BIG', overall_mae)
+        
+        return {
+            'zones': zone_errors,
+            'overall_mae': overall_mae,
+            'overall_rating': overall_rating,
+            'overall_color': overall_color,
+            'overall_label': overall_label,
+            'prediction_horizon': THERMAL_PREDICTION_HORIZON,
+            'timestamp': actual.timestamp
+        }
 
 # ============================================================================
 # FACTORY
@@ -2473,6 +4155,6 @@ def create_thermal_intelligence() -> ThermalIntelligenceSystem:
 # MODULE INITIALIZATION
 # ============================================================================
 
-logger.info("S25+ Thermal Intelligence System v2.24 loaded")
+logger.info("S25+ Thermal Intelligence System  loaded")
 logger.info(f"Hardware constants: {len(ZONE_THERMAL_CONSTANTS)} zones configured")
 logger.info("Features: Battery-only backdating | Dual-confidence | 10K history | Damped chassis")

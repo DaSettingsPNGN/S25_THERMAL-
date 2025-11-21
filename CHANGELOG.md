@@ -1,45 +1,40 @@
 # Changelog
 
-## [Current State] - 2025-11-05
+## Current State
 
-### Production Status
-- Discord bot serving 600+ members
-- Samsung Galaxy S25+ deployment  
-- 24/7 operation with zero thermal shutdowns
-- Physics-based thermal management preventing throttling
-- Mobile computing: flagship phone as production infrastructure
+### Validation Metrics
+Validated over 152,418 predictions (6.25 hours continuous operation):
+- Overall: 0.58°C MAE (transients filtered), 1.09°C MAE (raw)
+- Steady-state: 0.47°C MAE
+- Battery: 0.24°C MAE
+- 96.5% within 5°C (3.5% transients during load changes)
+- Stress test (95°C+ CPUs): 1.23°C MAE recovery tracking
 
 ### Architecture
 **Multi-zone monitoring:**
-- CPU_BIG, CPU_LITTLE, GPU, BATTERY, MODEM, CHASSIS
-- 10s sampling interval
+- CPU_BIG, CPU_LITTLE, GPU, BATTERY, MODEM, CHASSIS, AMBIENT
+- 1s sampling interval (THERMAL_SAMPLE_INTERVAL = 1.0)
 - 30s prediction horizon
 - Per-zone thermal constants from hardware measurement
 
 **Physics engine:**
 - Newton's law of cooling with measured τ per zone
-- Battery: τ=540s, simplified power integration
-- Fast zones (CPU/GPU): τ=14-23s, full exponential model
+- Battery: τ=210s, simplified power integration
+- Fast zones (CPU/GPU): τ=50-95s, full exponential model
 - Dual-confidence system: physics × sample-size weighting
-- Observed peak predictions when components throttled
+- Observed peak predictions when zones are throttled
 
 **Dual-condition throttle:**
-- Battery temperature prediction (Samsung throttles at 42°C)
-- CPU velocity spike detection (>3.0°C/s indicates regime change)
-- Prevents thermal runaway before physics model breaks
-
-**Thermal tank:**
-- Simple bool throttle decision (should_throttle)
-- Battery-centric with CPU velocity early warning
-- Thermal budget calculation (seconds until throttle)
-- Cooling rate and recommended delay
+- Battery temperature: Predicted temp vs 38.5°C threshold (2° safety margin)
+- CPU velocity: >3.0°C/s indicates regime change
+- Prevents both slow battery heating and fast CPU spikes
 
 ### API
 **Primary interface:**
 ```python
 thermal.get_tank_status() → ThermalTankStatus
 ```
-Returns battery temps, should_throttle bool, throttle_reason enum, thermal budget, cooling rate, CPU velocities.
+Returns battery temps, should_throttle bool, thermal budget, cooling rate.
 
 **Additional methods:**
 ```python
@@ -50,54 +45,41 @@ thermal.get_statistics() → Dict  # Runtime stats
 ```
 
 ### Performance
-**Prediction accuracy:** ~0.5°C MAE at 30s horizon (normal regime)
-
-**Characteristics:**
-- Battery zone most predictable (τ=540s, 0.04°C MAE)
-- CPU zones accurate despite 20°C/s spikes (0.5-0.6°C MAE)
-- Throttled zones use observed peaks (avoids -30 to -60°C errors)
-- Network state (5G vs WiFi) affects baseline
-- Charging state significantly impacts temperature
+**From 152k prediction validation:**
+- Overall: 0.58°C MAE (transients filtered), 1.09°C MAE (raw)
+- Steady-state: 0.47°C MAE
+- Battery: 0.24°C MAE (τ=210s, most predictable)
+- CPUs: 0.83-0.88°C MAE (τ=50-60s)
+- GPU: 0.84°C MAE (τ=95s)
+- 96.5% of predictions within 5°C
 
 ### Technical Details
 **Thermal constants:**
-- Measured from cooling curve analysis (1105 samples)
-- Exponential decay fits: T(t) = T_amb + (T₀ - T_amb)·exp(-t/τ)
+- Measured from step response testing
 - Per-zone: thermal mass, thermal resistance, ambient coupling
 - Hardware-specific (Snapdragon 8 Elite for Galaxy)
+- CPU_BIG: τ=50s, CPU_LITTLE: τ=60s, GPU: τ=95s
+- BATTERY: τ=210s, MODEM: τ=80s, CHASSIS: τ=100s
 
 **Sampling:**
-- Uniform 1s intervals via termux-api (non-rooted)
-- No backdating - all sensors report current temperature
-- Battery current measured for power-aware predictions
+- 1s interval (THERMAL_SAMPLE_INTERVAL = 1.0)
+- Uniform sampling across all zones
+- Battery uses simplified power integration due to high τ
 
 **Storage:**
-- Thermal samples in-memory deque (120 samples = 2 min history)
+- Memory-mapped persistence for adaptive tuner state
+- Thermal samples in-memory deque (50 min history)
 - Predictions stored for validation
-- Single-file architecture optimized for Termux filesystem constraints
 
 ### Files
-- s25_thermal.py (2478 lines) - Complete system
+- s25_thermal.py (4160 lines) - Complete system
 - Types defined inline (ThermalZone, ThermalState, ThrottleReason, etc.)
-- Single file architecture (import overhead matters on mobile)
-
-### Removed Features
-- Adaptive damping / TransientResponseTuner (dead code, removed)
-- Pattern learning / command thermal signatures (not implemented)
-- Complex event callback infrastructure (simplified to tank status)
-
-### Current Focus
-System optimized for production stability and accurate temperature prediction to prevent Samsung throttling at 42°C. Dual-condition throttle (battery + velocity) provides comprehensive protection from thermal issues. Mobile-first design for running production workloads on flagship phones instead of paying for cloud servers.
+- Single file architecture for minimal thermal overhead
 
 ---
 
-## Historical Context
+## Design Philosophy
 
-Previous iterations explored:
-- Adaptive damping (removed - raw physics was already accurate)
-- Command thermal signature learning
-- Multi-rate sampling strategies
-- Various backdating approaches for die sensors
-- Different confidence scoring methods
+Physics-based predictions with empirical validation. When physics breaks (throttled regimes, regime changes), use observed data. Dual-condition throttle catches both slow battery heating and fast CPU spikes.
 
-Current version represents production-validated physics model with measured accuracy metrics (21,973 predictions validated) and proven stability over 24/7 operation on mobile hardware.
+System optimized for production stability on mobile hardware with variable thermal environments.
