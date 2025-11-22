@@ -1538,28 +1538,6 @@ class ZonePhysicsEngine:
         # No history tracking - just return velocity as reliable
         return velocity, True
     
-    def calculate_component_throttle(self, zone_temp: float, zone_name: str) -> float:
-        """
-        Calculate per-component throttle based on temperature.
-        Components throttle themselves as temps rise.
-        """
-        if zone_name not in COMPONENT_THROTTLE_CURVES:
-            return 1.0
-        
-        curve = COMPONENT_THROTTLE_CURVES[zone_name]
-        temp_start = curve['temp_start']
-        temp_aggressive = curve['temp_aggressive']
-        min_factor = curve['min_factor']
-        
-        if zone_temp <= temp_start:
-            return 1.0
-        elif zone_temp >= temp_aggressive:
-            return min_factor
-        else:
-            # Linear interpolation between start and aggressive
-            progress = (zone_temp - temp_start) / (temp_aggressive - temp_start)
-            return 1.0 - (1.0 - min_factor) * progress
-    
     def calculate_throttle_factor(self, battery_temp: float, zone_name: str) -> float:
         """
         Calculate power throttling factor based on battery temperature.
