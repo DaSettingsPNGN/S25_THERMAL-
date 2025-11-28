@@ -4,11 +4,11 @@
 
 Multi-zone temperature monitoring with Newton's law predictions and observed peak shortcuts for throttled regimes. Dual-condition throttle system: battery temperature prediction + CPU velocity spike detection.
 
-Validation results over 152k predictions (6.25 hours continuous operation):
-- Overall: 0.58°C MAE (transients filtered), 0.47°C MAE (steady-state)
-- Battery prediction: 0.24°C MAE
-- 96.5% of predictions within 5°C (3.5% transients during load changes)
-- Stress test: CPUs sustained 95°C+ with 1.23°C MAE recovery tracking
+Validation results over 457k predictions (18.7 hours continuous operation):
+- Overall steady-state: 1.22°C MAE, 73% within 1°C
+- Battery prediction: 0.375°C MAE, 0.2°C median
+- Temperature range validated: 2°C to 95°C (cold boot to near-TJmax)
+- 97.8% steady-state, 2.2% transients during regime changes
 
 ---
 
@@ -17,6 +17,21 @@ Validation results over 152k predictions (6.25 hours continuous operation):
 Monitors 7 thermal zones, predicts temperatures 30s ahead using Newton's law (or observed peaks when throttled), detects regime changes via CPU velocity spikes, and provides bool throttle decisions.
 
 **Designed for:** Production workloads on mobile hardware with variable thermal environments.
+
+---
+
+## How This Compares
+
+| System | MAE | Conditions |
+|--------|-----|------------|
+| **This system (battery)** | **0.375°C** | Production phone, unknown workload, 30s horizon |
+| PINN + LSTM (2025) | 0.29°C | Lab, known 2.0C charge rate, same cell |
+| FCN-GBM hybrid (2024) | 0.46°C | Lab, 20% training data from test cell |
+| RNN benchmark (2024) | 0.15°C | Lab, Bayesian-optimized hyperparameters |
+| Crowdsourced phones (2020) | 1.5°C | Estimating ambient from battery |
+| Data center ML (2020) | 2.38°C | Gradient boosting, server racks |
+
+The sub-0.3°C systems are doing **interpolation**—trained on the exact battery and conditions they test on. This is **extrapolation** with no training data, predicting 30s into an unknown future on production hardware.
 
 ---
 
@@ -88,8 +103,8 @@ else:
 ```python
 tank = thermal.get_tank_status()
 
-# Normal: <0.4°C/s, Warning: >0.5°C/s, Danger: >1.0°C/s
-if tank.cpu_big_velocity > 1.0 or tank.cpu_little_velocity > 1.0:
+# Normal: <0.5°C/s, Danger: >3.0°C/s
+if tank.cpu_big_velocity > 3.0 or tank.cpu_little_velocity > 3.0:
     print("⚠️ Regime change detected - workload spike!")
     # Throttle kicks in automatically
 ```
@@ -176,20 +191,20 @@ if current_temp >= THROTTLE_START:
 ### Observed Peaks (from validation)
 
 ```python
-'CPU_BIG': 79.1°C      # Starts throttling at 45°C
-'CPU_LITTLE': 93.4°C   # Starts throttling at 48°C
-'GPU': 58.1°C          # Starts throttling at 38°C
-'MODEM': 59.7°C        # Starts throttling at 40°C
-'BATTERY': 35.2°C      # Doesn't self-throttle
+'CPU_BIG': 84°C        # Starts throttling at 45°C
+'CPU_LITTLE': 98°C     # Starts throttling at 48°C
+'GPU': 66°C            # Starts throttling at 38°C
+'MODEM': 68°C          # Starts throttling at 40°C
+'BATTERY': 39°C        # Doesn't self-throttle
 ```
 
 ### Thermal Time Constants
 
 **Measured from hardware:**
-- CPU_BIG: τ = 50s
-- CPU_LITTLE: τ = 60s
-- GPU: τ = 95s
-- MODEM: τ = 80s
+- CPU_BIG: τ = 25s
+- CPU_LITTLE: τ = 35s
+- GPU: τ = 30s
+- MODEM: τ = 145s
 - BATTERY: τ = 210s (high thermal mass)
 - CHASSIS: τ = 100s (vapor chamber + frame)
 
@@ -306,7 +321,7 @@ async def monitor():
 
 ## Architecture: Single-File Design
 
-**Why 4,160 lines in one file?**
+**Why 3,949 lines in one file?**
 
 Mobile constraint: filesystem I/O generates thermal overhead.
 
@@ -354,17 +369,17 @@ Key constants in `s25_thermal.py`:
 # Prediction
 THERMAL_PREDICTION_HORIZON = 30.0       # seconds ahead
 THERMAL_SAMPLE_INTERVAL = 1.0           # 1s sampling
-MIN_SAMPLES_FOR_PREDICTIONS = 3         # minimum before predicting
+MIN_SAMPLES_FOR_PREDICTIONS = 60        # 1 min warmup for ambient fitting
 
 # Throttle thresholds
-TANK_THROTTLE_TEMP = 38.5               # Battery °C (2° safety margin from Samsung's 40-42°C)
+TANK_THROTTLE_TEMP = 38.5               # Battery °C (safety margin from Samsung's 40-42°C)
 CPU_VELOCITY_DANGER = 3.0               # °C/s - regime change threshold
 
 # Throttle curves (observed from validation)
 COMPONENT_THROTTLE_CURVES = {
     'CPU_BIG': {
         'temp_start': 45.0,
-        'observed_peak': 79.1,
+        'observed_peak': 84.0,
         ...
     },
     ...
@@ -375,7 +390,7 @@ COMPONENT_THROTTLE_CURVES = {
 
 ## Architecture
 
-**Single file (2798 lines):** s25_thermal.py contains everything.
+**Single file (3,949 lines):** s25_thermal.py contains everything.
 
 **Components:**
 1. **ThermalTelemetryCollector** - Reads sensors, detects network
@@ -397,23 +412,42 @@ COMPONENT_THROTTLE_CURVES = {
 
 ## Validation Metrics
 
-**152k predictions over 6.25 hours:**
+**457k predictions over 18.7 hours:**
 
-**Overall accuracy:**
-- Transient-filtered: 0.58°C MAE, 95th percentile 2.25°C
-- Steady-state: 0.47°C MAE
-- Including transients: 1.09°C MAE (3.5% of predictions >5°C)
+**Overall accuracy (steady-state, 97.8% of samples):**
+- MAE: 1.22°C
+- Bias: -0.016°C (essentially zero)
+- Within 1°C: 73.0%
+- Within 2°C: 86.4%
 
-**Per-zone accuracy (transient-filtered):**
-- BATTERY: 0.22°C MAE
-- CPU_BIG: 0.88°C MAE
-- CPU_LITTLE: 0.83°C MAE
-- GPU: 0.84°C MAE
-- MODEM: 0.75°C MAE
+**Per-zone accuracy (steady-state):**
 
-**Stress test (max load, CPUs 95°C+):**
-- Raw MAE: 8.44°C (32.7% transients during thermal cycling)
-- Filtered MAE: 1.23°C (recovery tracking after transients clear)
+| Zone | MAE | Median | Within 1°C | Temp Range |
+|------|-----|--------|------------|------------|
+| **BATTERY** | **0.375°C** | **0.20°C** | **91.5%** | 2°C – 39°C |
+| CHASSIS | 1.00°C | 0.52°C | 73.6% | 4°C – 53°C |
+| MODEM | 1.54°C | 0.73°C | 60.9% | 5°C – 65°C |
+| GPU | 1.55°C | 0.71°C | 62.2% | 5°C – 64°C |
+| CPU_BIG | 1.86°C | 0.82°C | 60.9% | 4°C – 82°C |
+| CPU_LITTLE | 2.35°C | 0.96°C | 59.9% | 5°C – 95°C |
+
+**Error percentiles:**
+- P50: 0.40°C
+- P75: 1.12°C
+- P90: 2.53°C
+- P95: 4.73°C
+- P99: 13.44°C
+
+**Normal operation (excluding stress test periods):**
+- MAE: 0.76°C
+- Within 1°C: 77.7%
+- P50: 0.33°C
+
+**Transient analysis (2.2% of samples):**
+- Physics can't predict regime changes—expected limitation
+- CPU_BIG transients: 9.96°C MAE
+- CPU_LITTLE transients: 6.72°C MAE
+- Use CPU velocity detection instead of trusting physics during spikes
 
 ---
 
@@ -428,15 +462,15 @@ ls /sys/class/thermal/thermal_zone*/temp
 
 ### False CPU Velocity Alerts
 
-Velocity threshold (1.0°C/s) might be too sensitive. Increase to 1.5°C/s:
+Velocity threshold (3.0°C/s) might be too sensitive for your workload. Adjust:
 
 ```python
-ThermalTank.CPU_VELOCITY_DANGER = 1.5  # Was 1.0
+CPU_VELOCITY_DANGER = 4.0  # Was 3.0
 ```
 
 ### Battery Temperature Stable
 
-Battery has τ=540s. Changes are slow. This is correct behavior.
+Battery has τ=210s. Changes are slow. This is correct behavior.
 
 ---
 

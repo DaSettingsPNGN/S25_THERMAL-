@@ -2,10 +2,11 @@
 
 **Physics-based thermal management with dual-condition throttle detection**
 
-Validated over 152k predictions (6.25 hours continuous operation):
-- Overall: 0.58°C MAE (transients filtered), 0.47°C MAE (steady-state)  
-- Battery: 0.24°C MAE
-- Stress test: 1.23°C MAE recovery tracking at 95°C+ CPU temps
+Validated over 457k predictions (18.7 hours continuous operation):
+- Overall steady-state: 1.22°C MAE, 73% within 1°C
+- Battery: 0.375°C MAE, 0.2°C median
+- Temperature range: 2°C to 95°C (cold boot to near-TJmax)
+- Normal operation: 0.76°C MAE, 77.7% within 1°C
 
 ---
 
@@ -26,10 +27,10 @@ Combined approach catches both slow battery heating and fast CPU spikes.
 When zones reach throttle temperatures, physics breaks down (model assumes constant power, but throttling changes power mid-flight). Solution: use empirical data.
 
 **Observed peaks from validation:**
-- CPU_BIG: 81.0°C (starts throttling at 45°C)
-- CPU_LITTLE: 94.0°C (starts throttling at 48°C)  
-- GPU: 61.0°C (starts throttling at 38°C)
-- MODEM: 62.0°C (starts throttling at 40°C)
+- CPU_BIG: 84.0°C (starts throttling at 45°C)
+- CPU_LITTLE: 98.0°C (starts throttling at 48°C)  
+- GPU: 66.0°C (starts throttling at 38°C)
+- MODEM: 68.0°C (starts throttling at 40°C)
 
 When `current_temp >= throttle_start`, predict observed_peak instead of using Newton's law.
 
@@ -38,17 +39,30 @@ When `current_temp >= throttle_start`, predict observed_peak instead of using Ne
 ## Thermal Constants
 
 **Measured from hardware:**
-- CPU_BIG: τ=50s, thermal mass=20 J/K
-- CPU_LITTLE: τ=60s, thermal mass=40 J/K
-- GPU: τ=95s, thermal mass=40 J/K
+- CPU_BIG: τ=25s, thermal mass=20 J/K
+- CPU_LITTLE: τ=35s, thermal mass=40 J/K
+- GPU: τ=30s, thermal mass=40 J/K
 - BATTERY: τ=210s, thermal mass=75 J/K
-- MODEM: τ=80s, thermal mass=35 J/K
+- MODEM: τ=145s, thermal mass=35 J/K
 - CHASSIS: τ=100s, thermal mass=40 J/K
 
 **Sampling:**
 - 1s interval (THERMAL_SAMPLE_INTERVAL = 1.0)
 - 30s prediction horizon
-- Minimum 3 samples before predictions enabled
+- Minimum 60 samples before predictions enabled (1 min warmup)
+
+---
+
+## How This Compares
+
+| System | MAE | Conditions |
+|--------|-----|------------|
+| **This system (battery)** | **0.375°C** | Production phone, unknown workload, 30s horizon |
+| PINN + LSTM (2025) | 0.29°C | Lab, known 2.0C charge rate, same cell |
+| FCN-GBM hybrid (2024) | 0.46°C | Lab, 20% training data from test cell |
+| RNN benchmark (2024) | 0.15°C | Lab, Bayesian-optimized hyperparameters |
+
+The sub-0.3°C systems are doing **interpolation**—trained on the exact conditions they test on. This is **extrapolation** with no training data.
 
 ---
 
@@ -81,7 +95,7 @@ class ThrottleReason(Enum):
 ```python
 THERMAL_PREDICTION_HORIZON = 30.0       # seconds
 THERMAL_SAMPLE_INTERVAL = 1.0           # 1s sampling
-TANK_THROTTLE_TEMP = 38.5               # Battery °C (2° safety margin)
+TANK_THROTTLE_TEMP = 38.5               # Battery °C (safety margin)
 CPU_VELOCITY_DANGER = 3.0               # °C/s regime change threshold
 ```
 
