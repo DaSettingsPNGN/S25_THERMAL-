@@ -1854,6 +1854,12 @@ class ZonePhysicsEngine:
         predicted_battery_temp = None
         current_battery_temp = current.zones.get(ThermalZone.BATTERY, None)
         
+        # Track last valid battery temp for burst detection fallback
+        if current_battery_temp is not None:
+            self._last_battery_temp = current_battery_temp
+        elif not hasattr(self, '_last_battery_temp'):
+            self._last_battery_temp = None
+        
         if current_battery_temp is not None and 'BATTERY' in self.zone_constants:
             battery_constants = self.zone_constants['BATTERY']
             C = battery_constants['thermal_mass']
@@ -2008,44 +2014,7 @@ class ZonePhysicsEngine:
                 heating_rate = vel - cooling_rate
                 P_observed = heating_rate * C
             
-            P = P_observed
-            
-            # ====================================================================
-            # BURST DETECTION: Component hot but chassis not following
-            # ====================================================================
-            # If component is above burst threshold but chassis velocity/acceleration
-            # indicates no sustained load, this is a burst - use idle power.
-            # Chassis is the thermal integrator (slow τ) - only moves for real load.
-            if zone_name in BURST_DETECTION_THRESHOLD:
-                burst_threshold = BURST_DETECTION_THRESHOLD[zone_name]
-                if current_temp > burst_threshold:
-                    # Component is above burst threshold - check if chassis agrees
-                    chassis_vel = velocity.zones.get(ThermalZone.CHASSIS, 0.0)
-                    
-                    # Calculate chassis acceleration from recent samples if available
-                    chassis_accel = 0.0
-                    if samples and len(samples) >= 3:
-                        # Get last 3 chassis temps
-                        chassis_temps = []
-                        chassis_times = []
-                        for s in samples[-3:]:
-                            if ThermalZone.CHASSIS in s.zones:
-                                chassis_temps.append(s.zones[ThermalZone.CHASSIS])
-                                chassis_times.append(s.timestamp)
-                        
-                        if len(chassis_temps) >= 3:
-                            dt1 = chassis_times[1] - chassis_times[0]
-                            dt2 = chassis_times[2] - chassis_times[1]
-                            if dt1 > 0 and dt2 > 0:
-                                vel1 = (chassis_temps[1] - chassis_temps[0]) / dt1
-                                vel2 = (chassis_temps[2] - chassis_temps[1]) / dt2
-                                chassis_accel = (vel2 - vel1) / ((dt1 + dt2) / 2)
-                    
-                    # Burst if chassis isn't warming (vel <= 0) or warming is slowing/flat (accel <= 0)
-                    if chassis_vel <= 0 or chassis_accel <= 0:
-                        P = constants['idle_power']
-            
-            # LEGACY: Still apply P_injected for non-CPU/GPU zones
+            # P_injected: known power sources for non-CPU/GPU zones
             # (This code adds display, network, baseline for zones that need it)
             # For CPU/GPU, battery_current method already accounts for these
             
@@ -2230,33 +2199,46 @@ class ZonePhysicsEngine:
             
             component_temp = ref_temp + temp_transient + temp_steady
             
-            # Use component temperature directly as prediction
+            # Start with physics prediction
             predicted_temp = component_temp
             
             # ========================================================================
-            # REGIME SWITCH: Plateau at max load
+            # BURST DETECTION: Component hot but chassis lagging
             # ========================================================================
-            # Below throttle start: Newton's law runs normally
-            # At/above throttle start: Check if heading to plateau
-            if zone_name in COMPONENT_THROTTLE_CURVES:
+            # Physics-based burst detection using thermal time constants
+            # Burst = velocity exceeds what chassis heating could sustain AND gap is significant
+            #
+            # vel: already computed and smoothed above (line ~1975)
+            # gap: component temp minus chassis temp
+            # vel_threshold: gap / tau_chassis (rate at which gap could be sustained)
+            # gap_threshold: thermal gradient × tau ratio (minimum significant gap)
+            
+            gap = current_temp - ref_temp  # T0 - T_chassis
+            tau_chassis = self.zone_constants['CHASSIS']['time_constant']
+            
+            # Gap threshold scales with thermal gradient through phone
+            T_battery = current_battery_temp if current_battery_temp else self._last_battery_temp
+            if T_battery is None:
+                T_battery = ref_temp - 5  # Fallback: assume 5°C gradient
+            gap_threshold = (ref_temp - T_battery) * (tau / tau_chassis)
+            vel_threshold = gap / tau_chassis
+            
+            # Use the smoothed velocity we already computed
+            if vel > vel_threshold and gap > gap_threshold:
+                # Burst ending: component will cool toward chassis
+                predicted_temp = ref_temp  # T_chassis
+                logger.debug(f"{zone_name}: BURST vel={vel:.2f}>{vel_threshold:.2f}, "
+                           f"gap={gap:.1f}>{gap_threshold:.1f} → {ref_temp:.1f}°C")
+            
+            # ========================================================================
+            # PLATEAU: Sustained max load
+            # ========================================================================
+            elif zone_name in COMPONENT_THROTTLE_CURVES:
                 curve = COMPONENT_THROTTLE_CURVES[zone_name]
-                
-                if current_temp >= curve['temp_start']:
-                    zone_velocity = velocity.zones.get(zone, 0)
-                    
-                    # Debug logging
-                    if current_temp > 60:
-                        logger.debug(f"{zone_name}: T0={current_temp:.1f}°C, vel={zone_velocity:.3f}°C/s, "
-                                   f"temp_aggressive={curve['temp_aggressive']}°C")
-                    
-                    # Plateau if:
-                    # 1. Heating rapidly (>1.0°C/s) toward max load, OR
-                    # 2. Already heavily throttled (>temp_aggressive)
-                    if zone_velocity > 1.0 or current_temp >= curve['temp_aggressive']:
-                        predicted_temp = curve['observed_peak']
-                        if current_temp > 60:
-                            logger.debug(f"{zone_name}: PLATEAU TRIGGERED → {predicted_temp}°C")
-                    # else: stable at moderate throttle, let physics run
+                if current_temp >= curve['temp_aggressive']:
+                    predicted_temp = curve['observed_peak']
+                    logger.debug(f"{zone_name}: PLATEAU T0={current_temp:.1f} >= "
+                               f"{curve['temp_aggressive']} → {predicted_temp}°C")
             
             # No artificial caps - trust the physics model
             
